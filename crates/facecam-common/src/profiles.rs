@@ -57,6 +57,117 @@ pub fn load_profile(name: &str) -> Result<Profile> {
     Ok(profile)
 }
 
+/// Load a profile applying family-prefixed lookup precedence:
+/// 1. ~/.config/facecam/profiles/<family>/<name>.toml
+/// 2. ~/.config/facecam/profiles/<name>.toml
+/// 3. Built-in defaults baked into the binary.
+pub fn load_profile_for_family(name: &str, family: &str) -> Result<Profile> {
+    let dir = profiles_dir();
+    let family_path = dir.join(family).join(format!("{}.toml", name));
+    if family_path.exists() {
+        return load_profile_from(&family_path);
+    }
+    let generic_path = dir.join(format!("{}.toml", name));
+    if generic_path.exists() {
+        return load_profile_from(&generic_path);
+    }
+    builtin_profile(name, family).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No profile {} (family={}) found and no built-in default",
+            name,
+            family
+        )
+    })
+}
+
+fn load_profile_from(path: &std::path::Path) -> Result<Profile> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read profile: {}", path.display()))?;
+    toml::from_str(&content).with_context(|| format!("Failed to parse profile: {}", path.display()))
+}
+
+/// Built-in profiles. Used when no on-disk profile exists.
+fn builtin_profile(name: &str, family: &str) -> Option<Profile> {
+    match (name, family) {
+        ("default", "facecam-pro") => Some(Profile {
+            name: "default".into(),
+            description: "Pro default — 1080p30 MJPG, auto exposure, auto focus".into(),
+            video_mode: Some(ProfileVideoMode {
+                width: 1920,
+                height: 1080,
+                fps: 30,
+                format: "MJPG".into(),
+            }),
+            controls: HashMap::from([
+                ("brightness".into(), 0),
+                ("contrast".into(), 32),
+                ("saturation".into(), 64),
+                ("gain".into(), 49),
+                ("white_balance_automatic".into(), 1),
+                ("auto_exposure".into(), 0),
+                ("focus_automatic_continuous".into(), 1),
+                ("power_line_frequency".into(), 2),
+            ]),
+        }),
+        ("streaming", "facecam-pro") => Some(Profile {
+            name: "streaming".into(),
+            description: "Pro streaming — 1080p60 MJPG".into(),
+            video_mode: Some(ProfileVideoMode {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                format: "MJPG".into(),
+            }),
+            controls: HashMap::from([
+                ("brightness".into(), 0),
+                ("contrast".into(), 36),
+                ("saturation".into(), 70),
+                ("white_balance_automatic".into(), 1),
+                ("auto_exposure".into(), 0),
+                ("focus_automatic_continuous".into(), 1),
+                ("power_line_frequency".into(), 2),
+            ]),
+        }),
+        ("4k", "facecam-pro") => Some(Profile {
+            name: "4k".into(),
+            description: "Pro 4K — 3840x2160 30fps MJPG (verified working)".into(),
+            video_mode: Some(ProfileVideoMode {
+                width: 3840,
+                height: 2160,
+                fps: 30,
+                format: "MJPG".into(),
+            }),
+            controls: HashMap::from([
+                ("brightness".into(), 0),
+                ("contrast".into(), 32),
+                ("saturation".into(), 64),
+                ("auto_exposure".into(), 0),
+                ("focus_automatic_continuous".into(), 1),
+                ("power_line_frequency".into(), 2),
+            ]),
+        }),
+        ("meeting", "facecam-pro") => Some(Profile {
+            name: "meeting".into(),
+            description: "Pro meeting — 720p30 MJPG, bandwidth-friendly".into(),
+            video_mode: Some(ProfileVideoMode {
+                width: 1280,
+                height: 720,
+                fps: 30,
+                format: "MJPG".into(),
+            }),
+            controls: HashMap::from([
+                ("brightness".into(), 0),
+                ("contrast".into(), 32),
+                ("saturation".into(), 64),
+                ("white_balance_automatic".into(), 1),
+                ("auto_exposure".into(), 0),
+                ("focus_automatic_continuous".into(), 1),
+            ]),
+        }),
+        _ => None,
+    }
+}
+
 /// Save a profile
 pub fn save_profile(profile: &Profile) -> Result<PathBuf> {
     let dir = profiles_dir();
@@ -206,5 +317,88 @@ pub fn create_default_profiles() -> Result<()> {
         }
     }
 
+    // Pro profiles (additive — original Facecam profiles untouched).
+    let pro_dir = profiles_dir().join("facecam-pro");
+    fs::create_dir_all(&pro_dir)?;
+    for name in &["default", "streaming", "4k", "meeting"] {
+        let path = pro_dir.join(format!("{}.toml", name));
+        if !path.exists() {
+            if let Some(p) = builtin_profile(name, "facecam-pro") {
+                let content = toml::to_string_pretty(&p)?;
+                fs::write(&path, content)?;
+                info!(name = %name, path = %path.display(), "Wrote Pro profile");
+            }
+        }
+    }
+
     Ok(())
+}
+
+#[cfg(test)]
+mod profile_lookup_tests {
+    use super::*;
+    use std::env;
+    use std::fs;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    // Serialize env-mutating tests; FACECAM_CONFIG_DIR is process-global so parallel
+    // test threads would race and observe each other's state.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_temp_config<F: FnOnce(&std::path::Path)>(f: F) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().expect("tmp");
+        let prev = env::var("FACECAM_CONFIG_DIR").ok();
+        env::set_var("FACECAM_CONFIG_DIR", tmp.path());
+        f(tmp.path());
+        match prev {
+            Some(p) => env::set_var("FACECAM_CONFIG_DIR", p),
+            None => env::remove_var("FACECAM_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    fn family_specific_profile_takes_precedence() {
+        with_temp_config(|root| {
+            fs::create_dir_all(root.join("profiles/facecam-pro")).unwrap();
+            fs::write(
+                root.join("profiles/default.toml"),
+                "name = \"default\"\n[controls]\nbrightness = 100\n",
+            )
+            .unwrap();
+            fs::write(
+                root.join("profiles/facecam-pro/default.toml"),
+                "name = \"default\"\n[controls]\nbrightness = 200\n",
+            )
+            .unwrap();
+            let p = load_profile_for_family("default", "facecam-pro").expect("load");
+            assert_eq!(p.controls.get("brightness"), Some(&200));
+        });
+    }
+
+    #[test]
+    fn falls_back_to_generic_when_no_family_profile() {
+        with_temp_config(|root| {
+            fs::create_dir_all(root.join("profiles")).unwrap();
+            fs::write(
+                root.join("profiles/default.toml"),
+                "name = \"default\"\n[controls]\nbrightness = 100\n",
+            )
+            .unwrap();
+            let p = load_profile_for_family("default", "facecam-pro").expect("load");
+            assert_eq!(p.controls.get("brightness"), Some(&100));
+        });
+    }
+
+    #[test]
+    fn falls_back_to_builtin_when_no_files() {
+        with_temp_config(|_| {
+            let p = load_profile_for_family("default", "facecam-pro").expect("load");
+            assert_eq!(
+                p.video_mode.as_ref().map(|v| v.format.as_str()),
+                Some("MJPG")
+            );
+        });
+    }
 }

@@ -166,15 +166,16 @@ fn run_pipeline_once(
         );
     }
 
-    let profile = profiles::load_profile(&config.profile_name).unwrap_or_else(|_| {
-        warn!(profile = %config.profile_name, "Failed to load profile, using built-in default");
-        profiles::Profile {
-            name: "fallback".into(),
-            description: "Auto-generated fallback".into(),
-            video_mode: None,
-            controls: Default::default(),
-        }
-    });
+    let profile = profiles::load_profile_for_family(&config.profile_name, product.family())
+        .unwrap_or_else(|_| {
+            warn!(profile = %config.profile_name, "Failed to load profile, using built-in default");
+            profiles::Profile {
+                name: "fallback".into(),
+                description: "Auto-generated fallback".into(),
+                video_mode: None,
+                controls: Default::default(),
+            }
+        });
 
     let target_mode = if let Some(ref pvm) = profile.video_mode {
         let want_format = facecam_common::formats::PixelFormat::from_fourcc(u32::from_le_bytes(
