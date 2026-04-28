@@ -756,8 +756,11 @@ fn decode_mjpeg(
     buf_w: usize,
 ) {
     let mut decoder = jpeg_decoder::Decoder::new(data);
-    // Force RGB output regardless of JPEG color space
-    decoder.set_color_transform(jpeg_decoder::ColorTransform::RGB);
+    // Let the decoder auto-detect color space from JFIF markers and apply
+    // YCbCr to RGB conversion. The previous explicit ColorTransform::RGB
+    // override skipped that conversion, which left Y, Cb, Cr planes mapped
+    // directly to R, G, B and produced the green-and-magenta tint seen on
+    // the Facecam Pro's standard YCbCr 4:2:0 MJPEG output.
     match decoder.decode() {
         Ok(pixels) => {
             let info = decoder.info().unwrap();
