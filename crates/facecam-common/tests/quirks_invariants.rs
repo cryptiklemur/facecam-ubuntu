@@ -126,3 +126,36 @@ fn unknown_pid_gets_no_quirks() {
     let q = applicable_quirks(ElgatoProduct::Unknown(0x9999), FW_FACECAM_409);
     assert!(q.is_empty());
 }
+
+#[test]
+fn pro_has_stream_start_race_quirk() {
+    let q = applicable_quirks(ElgatoProduct::FacecamPro, FW_PRO_006);
+    let entry = q
+        .iter()
+        .find(|q| q.id == "PRO_STREAM_START_RACE")
+        .expect("PRO_STREAM_START_RACE must apply to FacecamPro");
+    assert!(matches!(
+        entry.mitigation,
+        facecam_common::quirks::QuirkMitigation::RetryStreamOn
+    ));
+}
+
+#[test]
+fn pro_has_usb_reset_destructive_quirk() {
+    let q = applicable_quirks(ElgatoProduct::FacecamPro, FW_PRO_006);
+    let entry = q
+        .iter()
+        .find(|q| q.id == "PRO_USB_RESET_DESTRUCTIVE")
+        .expect("PRO_USB_RESET_DESTRUCTIVE must apply to FacecamPro");
+    assert!(matches!(
+        entry.mitigation,
+        facecam_common::quirks::QuirkMitigation::AvoidUnlessLastResort
+    ));
+}
+
+#[test]
+fn pro_quirks_do_not_leak_to_facecam() {
+    let q = applicable_quirks(ElgatoProduct::Facecam, FW_FACECAM_409);
+    assert!(!q.iter().any(|q| q.id == "PRO_STREAM_START_RACE"));
+    assert!(!q.iter().any(|q| q.id == "PRO_USB_RESET_DESTRUCTIVE"));
+}

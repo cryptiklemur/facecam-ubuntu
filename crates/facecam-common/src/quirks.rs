@@ -195,6 +195,44 @@ static REGISTRY: &[Quirk] = &[
         severity: QuirkSeverity::Info,
         mitigation: QuirkMitigation::Manual("Verify empirically via frame byte inspection"),
     },
+    Quirk {
+        id: "PRO_STREAM_START_RACE",
+        summary: "Pro: stream-start often fails on first attempt; retry succeeds",
+        description: "On Elgato Facecam Pro (PID 0x0079, fw 0.06), \
+            back-to-back STREAMON cycles show a strong alternation: every \
+            other attempt returns zero frames within a 5s timeout, every \
+            other attempt streams normally. Empirically: 20-of-20 alternating \
+            cycles observed 2026-04-27 with no idle time between. Pattern \
+            softens (some adjacent OK/OK pairs) when idle time or non-streaming \
+            opens are interleaved. The recovery is cheap: a same-process retry \
+            (STREAMOFF then STREAMON, or close+reopen) succeeds. USB reset is \
+            NOT required — see PRO_USB_RESET_DESTRUCTIVE.",
+        products: &[ElgatoProduct::FacecamPro],
+        firmware_min: None,
+        firmware_max: None,
+        format: None,
+        severity: QuirkSeverity::Error,
+        mitigation: QuirkMitigation::RetryStreamOn,
+    },
+    Quirk {
+        id: "PRO_USB_RESET_DESTRUCTIVE",
+        summary: "Pro: USB sysfs reset is destructive — last resort only",
+        description: "On Elgato Facecam Pro (PID 0x0079, fw 0.06), \
+            `echo 0 > /sys/bus/usb/devices/.../authorized` returns ETIMEDOUT \
+            (the kernel disconnect-wait times out) but the device does \
+            re-enumerate. Multiple consecutive stream attempts after the reset \
+            return zero bytes; the device needs ~5 seconds of cool-down before \
+            it accepts streaming again. Empirically observed 2026-04-27. \
+            Recovery ladder must therefore use USB reset only after cheaper \
+            recoveries (in-place STREAMOFF/STREAMON, then close+reopen) have \
+            failed multiple times.",
+        products: &[ElgatoProduct::FacecamPro],
+        firmware_min: None,
+        firmware_max: None,
+        format: None,
+        severity: QuirkSeverity::Warning,
+        mitigation: QuirkMitigation::AvoidUnlessLastResort,
+    },
 ];
 
 /// Returns the quirks that apply to a given (product, firmware) pair.
