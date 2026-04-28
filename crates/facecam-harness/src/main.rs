@@ -380,7 +380,8 @@ fn test_open_close(dev_path: &str, cycles: u32) -> Result<serde_json::Value> {
                 }));
 
                 // Attempt USB reset to recover for next cycle
-                if let Err(reset_err) = recovery::usb_reset_facecam() {
+                let (product, _) = detect_product_firmware_or_default();
+                if let Err(reset_err) = recovery::usb_reset_product(product) {
                     warn!(error = %reset_err, "USB reset failed during open/close test");
                 } else {
                     std::thread::sleep(Duration::from_secs(2));
@@ -480,7 +481,8 @@ fn test_stream_stability(dev_path: &str, duration: Duration) -> Result<serde_jso
 }
 
 fn test_usb_topology() -> Result<serde_json::Value> {
-    let sysfs = usb::find_facecam_sysfs_path()?
+    let (product, _) = detect_product_firmware_or_default();
+    let sysfs = usb::find_elgato_sysfs_path(product)?
         .ok_or_else(|| anyhow::anyhow!("Facecam not found in sysfs"))?;
 
     let topo = usb::read_usb_topology(&sysfs)?;
@@ -534,16 +536,17 @@ fn test_kernel_modules() -> Result<serde_json::Value> {
 fn test_usb_recovery() -> Result<serde_json::Value> {
     info!("Testing USB reset recovery mechanism");
 
-    let presence = recovery::check_device_present()?;
+    let (product, _) = detect_product_firmware_or_default();
+    let presence = recovery::check_device_present(product)?;
     if !presence.connected {
         anyhow::bail!("Facecam not connected — cannot test recovery");
     }
 
-    let result = recovery::usb_reset_facecam()?;
+    let result = recovery::usb_reset_product(product)?;
 
     // Verify device came back
     std::thread::sleep(Duration::from_secs(2));
-    let post_presence = recovery::check_device_present()?;
+    let post_presence = recovery::check_device_present(product)?;
 
     if !post_presence.connected {
         anyhow::bail!("Device did not re-appear after USB reset");
@@ -604,10 +607,14 @@ fn print_single_result(result: &TestResult, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Detect the first connected UVC capture camera, falling back to Facecam.
+/// Accepts both Facecam (0x0078) and FacecamPro (0x0079) — anything that
+/// claims a UVC capture interface — so Pro hardware is correctly identified.
 fn detect_product_firmware_or_default() -> (ElgatoProduct, FirmwareVersion) {
+    use facecam_common::device::ProductDescriptor;
     usb::enumerate_elgato_devices()
         .ok()
-        .and_then(|devs| devs.into_iter().find(|d| d.product.is_facecam_original()))
+        .and_then(|devs| devs.into_iter().find(|d| d.product.is_uvc_capture()))
         .map(|d| (d.product, d.firmware))
         .unwrap_or((
             ElgatoProduct::Facecam,

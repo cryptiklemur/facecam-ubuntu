@@ -33,6 +33,7 @@ pub fn run(
 ) {
     let mut recovery_count: u32 = 0;
     let mut consecutive_failures: u32 = 0;
+    let mut last_product: Option<facecam_common::device::ElgatoProduct> = None;
 
     loop {
         // Check for shutdown
@@ -47,7 +48,7 @@ pub fn run(
         }
 
         // Run one pipeline lifecycle
-        match run_pipeline_once(&config, &status_tx, &mut shutdown_rx) {
+        match run_pipeline_once(&config, &status_tx, &mut shutdown_rx, &mut last_product) {
             Ok(()) => {
                 // Clean shutdown or signal
                 info!("Pipeline exited cleanly");
@@ -88,7 +89,11 @@ pub fn run(
                     attempt = consecutive_failures,
                     "Attempting USB reset recovery"
                 );
-                match recovery::usb_reset_facecam() {
+                let product_for_reset = last_product.unwrap_or_else(|| {
+                    warn!("No product detected yet, falling back to Facecam for USB reset");
+                    facecam_common::device::ElgatoProduct::Facecam
+                });
+                match recovery::usb_reset_product(product_for_reset) {
                     Ok(reset) => {
                         info!(sysfs = %reset.sysfs_path.display(), "USB reset successful");
                         // Wait for device to stabilize
@@ -112,10 +117,12 @@ fn run_pipeline_once(
     config: &PipelineConfig,
     status_tx: &Arc<Mutex<watch::Sender<DaemonStatus>>>,
     shutdown_rx: &mut broadcast::Receiver<()>,
+    last_product: &mut Option<facecam_common::device::ElgatoProduct>,
 ) -> Result<()> {
     // Phase 1: Detect device
     update_state(status_tx, PipelineState::Probing, HealthStatus::Degraded);
     let (source_path, product, firmware) = detect_source(&config.source_device)?;
+    *last_product = Some(product);
     info!(source = %source_path, product = %product, firmware = %firmware, "Source device detected");
     update_source(status_tx, Some(source_path.clone()));
 

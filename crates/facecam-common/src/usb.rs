@@ -101,35 +101,6 @@ pub fn find_usb_sysfs_path(bus: u8, addr: u8) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// Find sysfs path for Elgato Facecam by VID:PID
-pub fn find_facecam_sysfs_path() -> Result<Option<PathBuf>> {
-    let sysfs_base = Path::new("/sys/bus/usb/devices");
-    if !sysfs_base.exists() {
-        return Ok(None);
-    }
-
-    for entry in fs::read_dir(sysfs_base)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        let vid_path = path.join("idVendor");
-        let pid_path = path.join("idProduct");
-
-        if vid_path.exists() && pid_path.exists() {
-            let vid = fs::read_to_string(&vid_path)?.trim().to_string();
-            let pid = fs::read_to_string(&pid_path)?.trim().to_string();
-
-            if vid == format!("{:04x}", ELGATO_VID)
-                && pid == format!("{:04x}", ElgatoProduct::Facecam.pid())
-            {
-                return Ok(Some(path));
-            }
-        }
-    }
-
-    Ok(None)
-}
-
 /// Enumerate Elgato devices that expose a UVC capture interface.
 /// Production callers should use this rather than enumerate_elgato_devices,
 /// which returns every Elgato (including Stream Deck, Wave XLR).
@@ -155,6 +126,16 @@ pub fn enumerate_uvc_capture_devices() -> Result<Vec<DeviceFingerprint>> {
         out.push(fp);
     }
     Ok(out)
+}
+
+/// Detect the first connected Elgato UVC capture camera, falling back to
+/// Facecam if none found. Filters to UVC capture devices to avoid issuing
+/// USB resets against non-camera Elgato peripherals (Stream Deck, Wave XLR).
+pub fn detect_product_or_default() -> crate::device::ElgatoProduct {
+    enumerate_uvc_capture_devices()
+        .ok()
+        .and_then(|devs| devs.into_iter().next().map(|d| d.product))
+        .unwrap_or(crate::device::ElgatoProduct::Facecam)
 }
 
 /// Find the sysfs path for any specific Elgato product by VID:PID.

@@ -1,4 +1,3 @@
-use crate::usb::find_facecam_sysfs_path;
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,10 +11,9 @@ use tracing::{debug, error, info, warn};
 /// Writing 0 to the `authorized` sysfs file deauthorizes the device,
 /// causing the kernel to unbind the driver. Writing 1 reauthorizes it,
 /// causing re-enumeration — equivalent to a physical unplug/replug.
-pub fn usb_reset_facecam() -> Result<ResetResult> {
-    let sysfs_path =
-        find_facecam_sysfs_path()?.ok_or_else(|| anyhow::anyhow!("Facecam not found in sysfs"))?;
-
+pub fn usb_reset_product(product: crate::device::ElgatoProduct) -> Result<ResetResult> {
+    let sysfs_path = crate::usb::find_elgato_sysfs_path(product)?
+        .ok_or_else(|| anyhow::anyhow!("{} not found in sysfs", product))?;
     usb_reset_device(&sysfs_path)
 }
 
@@ -29,7 +27,6 @@ pub fn usb_reset_device(sysfs_path: &Path) -> Result<ResetResult> {
 
     info!(path = %sysfs_path.display(), "Performing USB reset via sysfs");
 
-    // Read current state
     let current = fs::read_to_string(&auth_path)
         .context("Failed to read authorized state")?
         .trim()
@@ -37,21 +34,30 @@ pub fn usb_reset_device(sysfs_path: &Path) -> Result<ResetResult> {
 
     debug!(current_state = %current, "Current authorized state");
 
-    // Deauthorize
-    fs::write(&auth_path, "0").context("Failed to deauthorize USB device")?;
-    info!("Device deauthorized, waiting for kernel cleanup");
+    let mut warnings = Vec::new();
 
-    // Wait for kernel to unbind driver
-    thread::sleep(Duration::from_millis(500));
+    // Deauthorize. The Pro returns ETIMEDOUT here but the disconnect still
+    // happens — record it as a warning rather than failing.
+    if let Err(e) = fs::write(&auth_path, "0") {
+        let kind = e.kind();
+        if matches!(kind, std::io::ErrorKind::TimedOut) || e.raw_os_error() == Some(libc::ETIMEDOUT)
+        {
+            warnings.push(format!("authorized=0 returned ETIMEDOUT: {}", e));
+        } else {
+            return Err(e).context("Failed to deauthorize USB device");
+        }
+    }
+    info!("Device deauthorized (or timed-out-but-disconnected), waiting for kernel cleanup");
 
-    // Reauthorize
+    // Longer wait — the Pro needs ~1.5s post-deauth, original tolerates the same.
+    thread::sleep(Duration::from_millis(1500));
+
     fs::write(&auth_path, "1").context("Failed to reauthorize USB device")?;
     info!("Device reauthorized, waiting for re-enumeration");
 
-    // Wait for kernel to re-enumerate
-    thread::sleep(Duration::from_millis(1500));
+    // Longer wait — the Pro needs ~4s before it accepts streaming.
+    thread::sleep(Duration::from_millis(4000));
 
-    // Verify device came back
     let new_state = fs::read_to_string(&auth_path)
         .context("Failed to read authorized state after reset")?
         .trim()
@@ -64,14 +70,25 @@ pub fn usb_reset_device(sysfs_path: &Path) -> Result<ResetResult> {
         );
     }
 
-    info!("USB reset complete, device re-enumerated");
+    info!(warning_count = warnings.len(), "USB reset complete");
 
     Ok(ResetResult {
         sysfs_path: sysfs_path.to_path_buf(),
         success: true,
         previous_state: current,
         new_state,
+        warnings,
     })
+}
+
+/// In-place STREAMOFF/STREAMON cycle for VIDEO_CAPTURE. Cheapest first-line
+/// recovery for the Pro's stream-start race (PRO_STREAM_START_RACE).
+pub fn stream_off_then_on(fd: std::os::unix::io::RawFd) -> Result<()> {
+    use crate::v4l2;
+    // EINVAL is expected if the device was not streaming; ignore.
+    let _ = v4l2::stream_off(fd, 1 /* V4L2_BUF_TYPE_VIDEO_CAPTURE */);
+    v4l2::stream_on(fd, 1).context("STREAMON after in-place recovery")?;
+    Ok(())
 }
 
 /// Attempt to start a stream with retry-on-failure logic.
@@ -84,6 +101,7 @@ pub fn usb_reset_device(sysfs_path: &Path) -> Result<ResetResult> {
 ///
 /// Returns the number of attempts needed.
 pub fn retry_with_reset<F, T>(
+    product: crate::device::ElgatoProduct,
     max_attempts: u32,
     operation_name: &str,
     mut operation: F,
@@ -124,13 +142,12 @@ where
 
                 if attempt < max_attempts {
                     info!("Performing USB reset before retry");
-                    match usb_reset_facecam() {
+                    match usb_reset_product(product) {
                         Ok(reset) => {
                             info!(
                                 sysfs = %reset.sysfs_path.display(),
                                 "USB reset successful, waiting before retry"
                             );
-                            // Extra wait after reset for device stabilization
                             thread::sleep(Duration::from_secs(1));
                         }
                         Err(reset_err) => {
@@ -145,27 +162,31 @@ where
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All {} attempts failed", max_attempts)))
 }
 
-/// Wait for the Facecam to appear in sysfs after a reset or plug event
-pub fn wait_for_device(timeout: Duration) -> Result<PathBuf> {
+/// Wait for an Elgato product to appear in sysfs after a reset or plug event
+pub fn wait_for_device(
+    product: crate::device::ElgatoProduct,
+    timeout: Duration,
+) -> Result<PathBuf> {
     let start = std::time::Instant::now();
     let poll_interval = Duration::from_millis(200);
 
     info!(
         timeout_ms = timeout.as_millis() as u64,
-        "Waiting for Facecam to appear"
+        "Waiting for {} to appear", product
     );
 
     loop {
         if start.elapsed() > timeout {
             bail!(
-                "Timeout waiting for Facecam to appear ({}ms)",
+                "Timeout waiting for {} to appear ({}ms)",
+                product,
                 timeout.as_millis()
             );
         }
 
-        match find_facecam_sysfs_path() {
+        match crate::usb::find_elgato_sysfs_path(product) {
             Ok(Some(path)) => {
-                info!(path = %path.display(), elapsed_ms = start.elapsed().as_millis() as u64, "Facecam found");
+                info!(path = %path.display(), elapsed_ms = start.elapsed().as_millis() as u64, "{} found", product);
                 return Ok(path);
             }
             Ok(None) => {}
@@ -184,11 +205,14 @@ pub struct ResetResult {
     pub success: bool,
     pub previous_state: String,
     pub new_state: String,
+    /// Non-fatal anomalies during reset (e.g. ETIMEDOUT on authorized=0
+    /// write, which the Pro produces but still re-enumerates afterward).
+    pub warnings: Vec<String>,
 }
 
-/// Check if the Facecam is currently connected and authorized
-pub fn check_device_present() -> Result<DevicePresence> {
-    match find_facecam_sysfs_path()? {
+/// Check if an Elgato product is currently connected and authorized
+pub fn check_device_present(product: crate::device::ElgatoProduct) -> Result<DevicePresence> {
+    match crate::usb::find_elgato_sysfs_path(product)? {
         Some(path) => {
             let auth_path = path.join("authorized");
             let authorized = if auth_path.exists() {
@@ -220,4 +244,31 @@ pub struct DevicePresence {
     pub connected: bool,
     pub authorized: bool,
     pub sysfs_path: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::device::ElgatoProduct;
+
+    #[test]
+    fn reset_result_supports_warnings() {
+        let r = ResetResult {
+            sysfs_path: PathBuf::from("/dev/null"),
+            success: true,
+            previous_state: "1".into(),
+            new_state: "1".into(),
+            warnings: vec!["authorized=0 timed out".into()],
+        };
+        assert_eq!(r.warnings.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires Facecam Pro hardware"]
+    fn usb_reset_product_finds_pro() {
+        let path = crate::usb::find_elgato_sysfs_path(ElgatoProduct::FacecamPro)
+            .expect("sysfs lookup")
+            .expect("Pro sysfs");
+        assert!(path.join("authorized").exists());
+    }
 }

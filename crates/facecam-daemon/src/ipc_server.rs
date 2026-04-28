@@ -252,7 +252,8 @@ async fn handle_command(
 
         DaemonCommand::ForceReset => {
             info!("Force reset requested via IPC");
-            match facecam_common::recovery::usb_reset_facecam() {
+            let product = facecam_common::usb::detect_product_or_default();
+            match facecam_common::recovery::usb_reset_product(product) {
                 Ok(_) => DaemonResponse::Ok(Some("USB reset completed".to_string())),
                 Err(e) => DaemonResponse::Error(format!("USB reset failed: {}", e)),
             }

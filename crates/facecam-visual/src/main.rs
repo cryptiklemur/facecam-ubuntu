@@ -640,7 +640,8 @@ fn handle_keys(
     // USB Reset
     if window.is_key_pressed(Key::R, minifb::KeyRepeat::No) {
         eprintln!("USB reset requested...");
-        match facecam_common::recovery::usb_reset_facecam() {
+        let product = facecam_common::usb::detect_product_or_default();
+        match facecam_common::recovery::usb_reset_product(product) {
             Ok(_) => eprintln!("USB reset complete. Device should re-appear."),
             Err(e) => eprintln!("USB reset failed: {}", e),
         }

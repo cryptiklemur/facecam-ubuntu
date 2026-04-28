@@ -258,7 +258,8 @@ fn cmd_controls(device: Option<String>, format: OutputFormat) -> Result<()> {
 }
 
 fn cmd_topology(format: OutputFormat) -> Result<()> {
-    let sysfs = usb::find_facecam_sysfs_path()?;
+    let (product, _) = detect_product_firmware_or_default();
+    let sysfs = usb::find_elgato_sysfs_path(product)?;
 
     match sysfs {
         Some(path) => {
@@ -537,10 +538,14 @@ fn validate_single_format(
     })
 }
 
+/// Detect the first connected UVC capture camera, falling back to Facecam.
+/// Accepts both Facecam (0x0078) and FacecamPro (0x0079) — anything that
+/// claims a UVC capture interface — so Pro hardware is correctly identified.
 fn detect_product_firmware_or_default() -> (ElgatoProduct, FirmwareVersion) {
+    use facecam_common::device::ProductDescriptor;
     usb::enumerate_elgato_devices()
         .ok()
-        .and_then(|devs| devs.into_iter().find(|d| d.product.is_facecam_original()))
+        .and_then(|devs| devs.into_iter().find(|d| d.product.is_uvc_capture()))
         .map(|d| (d.product, d.firmware))
         .unwrap_or((
             ElgatoProduct::Facecam,
