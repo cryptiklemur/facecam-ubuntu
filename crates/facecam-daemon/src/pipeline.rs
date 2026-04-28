@@ -115,19 +115,9 @@ fn run_pipeline_once(
 ) -> Result<()> {
     // Phase 1: Detect device
     update_state(status_tx, PipelineState::Probing, HealthStatus::Degraded);
-    let source_path = detect_source(&config.source_device)?;
-    info!(source = %source_path, "Source device detected");
+    let (source_path, product, firmware) = detect_source(&config.source_device)?;
+    info!(source = %source_path, product = %product, firmware = %firmware, "Source device detected");
     update_source(status_tx, Some(source_path.clone()));
-
-    // Stopgap until Task 5 plumbs (path, product, fw) through detect_source.
-    let (product, firmware) = usb::enumerate_elgato_devices()?
-        .into_iter()
-        .find(|d| d.product.is_facecam_original())
-        .map(|d| (d.product, d.firmware))
-        .unwrap_or((
-            facecam_common::device::ElgatoProduct::Facecam,
-            facecam_common::device::FirmwareVersion { major: 0, minor: 0 },
-        ));
 
     // Phase 2: Probe and configure
     let source_file = v4l2::open_device(&source_path).context("Failed to open source device")?;
@@ -319,35 +309,53 @@ fn run_pipeline_once(
     }
 }
 
-/// Detect the source V4L2 device path
-fn detect_source(explicit: &Option<String>) -> Result<String> {
+fn detect_source(
+    explicit: &Option<String>,
+) -> Result<(
+    String,
+    facecam_common::device::ElgatoProduct,
+    facecam_common::device::FirmwareVersion,
+)> {
+    use facecam_common::device::{ElgatoProduct, FirmwareVersion, ProductDescriptor};
+
     if let Some(dev) = explicit {
         if std::path::Path::new(dev).exists() {
-            return Ok(dev.clone());
+            // Caller-provided path — best-effort fingerprint via the live bus.
+            for cam in usb::enumerate_uvc_capture_devices()? {
+                if cam.v4l2_device.as_deref() == Some(dev.as_str()) {
+                    return Ok((dev.clone(), cam.product, cam.firmware));
+                }
+            }
+            // Unknown device behind the path; assume original Facecam to keep
+            // the original behavior compatible.
+            return Ok((
+                dev.clone(),
+                ElgatoProduct::Facecam,
+                FirmwareVersion { major: 0, minor: 0 },
+            ));
         }
         bail!("Specified source device {} does not exist", dev);
     }
 
-    // Auto-detect via USB enumeration
-    let devices = usb::enumerate_elgato_devices()?;
-    for dev in &devices {
-        if !dev.product.is_facecam_original() {
-            continue;
-        }
-        if let Ok(Some(sysfs)) = usb::find_usb_sysfs_path(dev.usb_bus, dev.usb_address) {
-            if let Ok(Some(v4l2_dev)) = usb::find_v4l2_device_for_usb(&sysfs) {
-                return Ok(v4l2_dev);
-            }
+    let cams = usb::enumerate_uvc_capture_devices()?;
+    if let Some(cam) = cams.into_iter().find(|c| c.product.is_uvc_capture()) {
+        if let Some(dev) = cam.v4l2_device {
+            return Ok((dev, cam.product, cam.firmware));
         }
     }
 
-    // Try udev symlink
     let symlink = "/dev/video-facecam";
     if std::path::Path::new(symlink).exists() {
-        return Ok(symlink.to_string());
+        // Fallback: device exists but enumeration didn't bind it — assume
+        // original Facecam (back-compat).
+        return Ok((
+            symlink.to_string(),
+            ElgatoProduct::Facecam,
+            FirmwareVersion { major: 0, minor: 0 },
+        ));
     }
 
-    bail!("Could not detect Facecam. Is it connected?")
+    bail!("No Elgato UVC capture device found. Use --device /dev/videoN to override.")
 }
 
 // Status update helpers — these acquire the mutex briefly to update specific fields

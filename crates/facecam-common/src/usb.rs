@@ -130,6 +130,59 @@ pub fn find_facecam_sysfs_path() -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+/// Enumerate Elgato devices that expose a UVC capture interface.
+/// Production callers should use this rather than enumerate_elgato_devices,
+/// which returns every Elgato (including Stream Deck, Wave XLR).
+pub fn enumerate_uvc_capture_devices() -> Result<Vec<DeviceFingerprint>> {
+    use crate::device::ProductDescriptor;
+    let mut out = Vec::new();
+    for mut fp in enumerate_elgato_devices()? {
+        if !fp.product.is_uvc_capture() {
+            continue;
+        }
+        if let Ok(Some(sysfs)) = find_usb_sysfs_path(fp.usb_bus, fp.usb_address) {
+            fp.v4l2_sysfs_path = Some(sysfs.to_string_lossy().to_string());
+            if let Ok(Some(node)) = find_v4l2_device_for_usb(&sysfs) {
+                fp.v4l2_device = Some(node);
+            } else {
+                // Sysfs is there but no /dev/video node yet — skip; the device
+                // descriptor says UVC but no capture node exists for us to use.
+                continue;
+            }
+        } else {
+            continue;
+        }
+        out.push(fp);
+    }
+    Ok(out)
+}
+
+/// Find the sysfs path for any specific Elgato product by VID:PID.
+pub fn find_elgato_sysfs_path(product: crate::device::ElgatoProduct) -> Result<Option<PathBuf>> {
+    let sysfs_base = Path::new("/sys/bus/usb/devices");
+    if !sysfs_base.exists() {
+        return Ok(None);
+    }
+
+    let want_pid = format!("{:04x}", product.pid());
+    let want_vid = format!("{:04x}", ELGATO_VID);
+
+    for entry in fs::read_dir(sysfs_base)? {
+        let entry = entry?;
+        let path = entry.path();
+        let vid_path = path.join("idVendor");
+        let pid_path = path.join("idProduct");
+        if vid_path.exists() && pid_path.exists() {
+            let vid = fs::read_to_string(&vid_path)?.trim().to_string();
+            let pid = fs::read_to_string(&pid_path)?.trim().to_string();
+            if vid == want_vid && pid == want_pid {
+                return Ok(Some(path));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Find the V4L2 device node associated with a USB device sysfs path
 pub fn find_v4l2_device_for_usb(usb_sysfs: &Path) -> Result<Option<String>> {
     // Walk the USB device tree looking for video4linux subdirectories
@@ -142,25 +195,34 @@ fn find_v4l2_node_recursive(path: &Path) -> Result<Option<String>> {
         for entry in fs::read_dir(&v4l_path)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("video") {
-                // Check index — we want index 0 (primary capture, not metadata)
-                let index_path = entry.path().join("index");
-                if index_path.exists() {
-                    let index: u32 = fs::read_to_string(&index_path)?
-                        .trim()
-                        .parse()
-                        .unwrap_or(u32::MAX);
-                    if index == 0 {
-                        return Ok(Some(format!("/dev/{}", name)));
-                    }
-                } else {
-                    return Ok(Some(format!("/dev/{}", name)));
-                }
+            if !name.starts_with("video") {
+                continue;
             }
+            let node_path = entry.path();
+            let index_path = node_path.join("index");
+            let is_primary = if index_path.exists() {
+                fs::read_to_string(&index_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .map(|i| i == 0)
+                    .unwrap_or(false)
+            } else {
+                true
+            };
+            if !is_primary {
+                continue;
+            }
+            // Validate that this V4L2 node actually reports VIDEO_CAPTURE
+            // capability — otherwise non-UVC interfaces (HID, audio control)
+            // can sneak through.
+            let dev = format!("/dev/{}", name);
+            if !v4l2_node_has_capture_capability(&dev) {
+                continue;
+            }
+            return Ok(Some(dev));
         }
     }
 
-    // Recurse into subdirectories (USB interfaces are children)
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries {
             let entry = entry?;
@@ -174,6 +236,20 @@ fn find_v4l2_node_recursive(path: &Path) -> Result<Option<String>> {
     }
 
     Ok(None)
+}
+
+/// Open the V4L2 device read-only and check QUERYCAP for VIDEO_CAPTURE.
+/// On any error (permission, device busy), returns false rather than failing
+/// the whole enumeration.
+fn v4l2_node_has_capture_capability(dev: &str) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(dev) else {
+        return false;
+    };
+    let Ok(caps) = crate::v4l2::query_capabilities(file.as_raw_fd()) else {
+        return false;
+    };
+    caps.has_capture
 }
 
 /// Read USB topology details for diagnostics
@@ -197,6 +273,59 @@ pub fn read_usb_topology(sysfs_path: &Path) -> Result<UsbTopology> {
         bcd_device: read_file("bcdDevice"),
         configuration: read_file("configuration"),
     })
+}
+
+#[cfg(test)]
+mod uvc_filter_tests {
+    use super::*;
+
+    #[test]
+    fn enumerate_uvc_capture_devices_returns_a_vec() {
+        // Smoke test: function exists with the right signature and returns
+        // without panicking. Result may be empty in CI.
+        let _ = enumerate_uvc_capture_devices();
+    }
+
+    // The following tests run against the live USB bus on the development
+    // machine. They are gated with #[ignore] so CI stays hardware-free; run
+    // locally with `cargo test -p facecam-common -- --ignored`.
+
+    #[test]
+    #[ignore = "requires live USB bus"]
+    fn enumerate_uvc_capture_devices_excludes_hid() {
+        let cams = enumerate_uvc_capture_devices().expect("enumeration");
+        for c in &cams {
+            // No Stream Deck Plus (0x0084), no Wave XLR (0x007d).
+            assert_ne!(c.product.pid(), 0x0084, "Stream Deck must not appear");
+            assert_ne!(c.product.pid(), 0x007d, "Wave XLR must not appear");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Facecam Pro at /dev/video0"]
+    fn pro_is_discoverable_as_uvc_capture() {
+        let cams = enumerate_uvc_capture_devices().expect("enumeration");
+        let pro = cams
+            .iter()
+            .find(|c| c.product.pid() == 0x0079)
+            .expect("Facecam Pro PID 0x0079 must be enumerable");
+        assert_eq!(
+            pro.v4l2_device.as_deref(),
+            Some("/dev/video0"),
+            "Pro should map to /dev/video0 on this machine"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Facecam Pro at /dev/video0"]
+    fn find_elgato_sysfs_path_resolves_pro() {
+        let p =
+            find_elgato_sysfs_path(crate::device::ElgatoProduct::FacecamPro).expect("sysfs scan");
+        let path = p.expect("Pro sysfs path");
+        assert!(path.exists(), "{} must exist", path.display());
+        let auth = std::fs::read_to_string(path.join("authorized")).expect("read authorized");
+        assert_eq!(auth.trim(), "1");
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
