@@ -22,6 +22,7 @@ mod overlays;
 use anyhow::{bail, Context, Result};
 use capture::MmapCapture;
 use clap::Parser;
+use facecam_common::device::ProductDescriptor;
 use facecam_common::{usb, v4l2};
 use minifb::{Key, Window, WindowOptions};
 use std::collections::VecDeque;
@@ -831,7 +832,7 @@ fn resolve_device(device: &Option<String>) -> Result<String> {
         if dev.product.is_usb2_fallback() {
             bail!("Facecam is in USB 2.0 fallback mode. Move to a USB 3.0 port.");
         }
-        if !dev.product.is_facecam_original() {
+        if !dev.product.is_uvc_capture() {
             continue;
         }
         if let Ok(Some(sysfs)) = usb::find_usb_sysfs_path(dev.usb_bus, dev.usb_address) {
