@@ -9,6 +9,7 @@ pub enum PixelFormat {
     Nv12,
     Yu12,
     Mjpeg,
+    H264,
     Unknown(u32),
 }
 
@@ -20,6 +21,7 @@ impl PixelFormat {
             b"NV12" => Self::Nv12,
             b"YU12" => Self::Yu12,
             b"MJPG" => Self::Mjpeg,
+            b"H264" => Self::H264,
             _ => Self::Unknown(fourcc),
         }
     }
@@ -31,6 +33,7 @@ impl PixelFormat {
             Self::Nv12 => u32::from_le_bytes(*b"NV12"),
             Self::Yu12 => u32::from_le_bytes(*b"YU12"),
             Self::Mjpeg => u32::from_le_bytes(*b"MJPG"),
+            Self::H264 => u32::from_le_bytes(*b"H264"),
             Self::Unknown(fourcc) => *fourcc,
         }
     }
@@ -45,7 +48,7 @@ impl PixelFormat {
         match self {
             Self::Yuyv | Self::Uyvy => Some(2.0),
             Self::Nv12 | Self::Yu12 => Some(1.5),
-            Self::Mjpeg => None, // Variable
+            Self::Mjpeg | Self::H264 => None,
             Self::Unknown(_) => None,
         }
     }
@@ -147,5 +150,29 @@ impl fmt::Display for FormatVerdict {
             Self::Unstable => write!(f, "UNSTABLE"),
             Self::Untested => write!(f, "UNTESTED"),
         }
+    }
+}
+
+#[cfg(test)]
+mod h264_tests {
+    use super::*;
+
+    #[test]
+    fn h264_round_trip_via_fourcc() {
+        let h264 = PixelFormat::from_fourcc(u32::from_le_bytes(*b"H264"));
+        assert_eq!(h264, PixelFormat::H264);
+        assert_eq!(h264.to_fourcc(), u32::from_le_bytes(*b"H264"));
+        assert_eq!(h264.fourcc_str(), "H264");
+    }
+
+    #[test]
+    fn h264_has_no_static_bytes_per_pixel() {
+        // Compressed format: bandwidth depends on content, not a fixed bpp.
+        assert!(PixelFormat::H264.bytes_per_pixel().is_none());
+    }
+
+    #[test]
+    fn h264_displays_as_fourcc() {
+        assert_eq!(format!("{}", PixelFormat::H264), "H264");
     }
 }
