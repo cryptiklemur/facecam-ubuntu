@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use facecam_common::{
-    device::UsbSpeed,
+    device::{ElgatoProduct, FirmwareVersion, UsbSpeed},
     diagnostics,
     formats::{FormatVerdict, VideoMode},
     quirks, usb, v4l2,
@@ -174,6 +174,8 @@ fn cmd_formats(device: Option<String>, format: OutputFormat) -> Result<()> {
     let file = v4l2::open_device(&dev_path)?;
     let fd = file.as_raw_fd();
 
+    let (product, firmware) = detect_product_firmware_or_default();
+
     let formats = v4l2::enumerate_formats(fd)?;
     let modes = v4l2::enumerate_all_modes(fd)?;
 
@@ -191,10 +193,10 @@ fn cmd_formats(device: Option<String>, format: OutputFormat) -> Result<()> {
 
         println!("Pixel Formats:");
         for fmt in &formats {
-            let reliable = if fmt.pixel_format.is_reliable_on_facecam() {
-                " [RELIABLE]"
-            } else {
+            let reliable = if quirks::is_format_known_broken(product, firmware, fmt.pixel_format) {
                 " [KNOWN BROKEN - see quirk registry]"
+            } else {
+                " [UNTESTED]"
             };
             println!(
                 "  [{}] {} - {}{}",
@@ -208,10 +210,10 @@ fn cmd_formats(device: Option<String>, format: OutputFormat) -> Result<()> {
                 .bandwidth_bytes_per_sec()
                 .map(|b| format!(" ({:.0} MB/s)", b as f64 / 1_000_000.0))
                 .unwrap_or_default();
-            let reliable = if mode.format.is_reliable_on_facecam() {
-                ""
-            } else {
+            let reliable = if quirks::is_format_known_broken(product, firmware, mode.format) {
                 " [BROKEN]"
+            } else {
+                ""
             };
             println!("  {}{}{}", mode, bw, reliable);
         }
@@ -303,7 +305,7 @@ fn cmd_quirks(format: OutputFormat) -> Result<()> {
             println!("=== Quirk Registry (all known quirks) ===\n");
             println!("No device connected — showing complete registry.\n");
             for q in quirks::quirk_registry() {
-                print_quirk(&q);
+                print_quirk(q);
             }
         }
         return Ok(());
@@ -515,10 +517,11 @@ fn validate_single_format(
     // For validation, we just check if the format negotiation succeeds
     // Full streaming validation requires MMAP buffer mapping which is complex
     // For now, report based on known quirk data
-    let verdict = if mode.format.is_reliable_on_facecam() {
-        FormatVerdict::Working
-    } else {
+    let (product, firmware) = detect_product_firmware_or_default();
+    let verdict = if quirks::is_format_known_broken(product, firmware, mode.format) {
         FormatVerdict::GarbageFrames
+    } else {
+        FormatVerdict::Working
     };
 
     Ok(facecam_common::formats::FormatProbeResult {
@@ -532,6 +535,17 @@ fn validate_single_format(
         error: None,
         verdict,
     })
+}
+
+fn detect_product_firmware_or_default() -> (ElgatoProduct, FirmwareVersion) {
+    usb::enumerate_elgato_devices()
+        .ok()
+        .and_then(|devs| devs.into_iter().find(|d| d.product.is_facecam_original()))
+        .map(|d| (d.product, d.firmware))
+        .unwrap_or((
+            ElgatoProduct::Facecam,
+            FirmwareVersion { major: 0, minor: 0 },
+        ))
 }
 
 /// Resolve a V4L2 device path — auto-detect if not specified

@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use facecam_common::{
-    profiles, recovery,
+    profiles, quirks, recovery,
     types::{DaemonStatus, HealthStatus, PipelineState},
     usb, v4l2,
 };
@@ -119,6 +119,16 @@ fn run_pipeline_once(
     info!(source = %source_path, "Source device detected");
     update_source(status_tx, Some(source_path.clone()));
 
+    // Stopgap until Task 5 plumbs (path, product, fw) through detect_source.
+    let (product, firmware) = usb::enumerate_elgato_devices()?
+        .into_iter()
+        .find(|d| d.product.is_facecam_original())
+        .map(|d| (d.product, d.firmware))
+        .unwrap_or((
+            facecam_common::device::ElgatoProduct::Facecam,
+            facecam_common::device::FirmwareVersion { major: 0, minor: 0 },
+        ));
+
     // Phase 2: Probe and configure
     let source_file = v4l2::open_device(&source_path).context("Failed to open source device")?;
     let source_fd = source_file.as_raw_fd();
@@ -133,9 +143,12 @@ fn run_pipeline_once(
 
     // Enumerate available modes and pick the best one
     let modes = v4l2::enumerate_all_modes(source_fd)?;
+    // Filter out modes whose format is in the quirk DB as known-broken
+    // for the detected (product, firmware). Modes not in the DB pass through —
+    // the daemon does not speculate about untested formats.
     let reliable_modes: Vec<_> = modes
         .iter()
-        .filter(|m| m.format.is_reliable_on_facecam())
+        .filter(|m| !quirks::is_format_known_broken(product, firmware, m.format))
         .collect();
 
     if reliable_modes.is_empty() {

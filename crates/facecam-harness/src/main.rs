@@ -1,7 +1,12 @@
 use anyhow::Result;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use facecam_common::{diagnostics, formats::PixelFormat, recovery, usb, v4l2};
+use facecam_common::{
+    device::{ElgatoProduct, FirmwareVersion},
+    diagnostics,
+    formats::PixelFormat,
+    quirks, recovery, usb, v4l2,
+};
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
@@ -281,6 +286,8 @@ fn test_format_enumeration(dev_path: &str) -> Result<serde_json::Value> {
     let file = v4l2::open_device(dev_path)?;
     let fd = file.as_raw_fd();
 
+    let (product, firmware) = detect_product_firmware_or_default();
+
     let formats = v4l2::enumerate_formats(fd)?;
     let modes = v4l2::enumerate_all_modes(fd)?;
 
@@ -291,7 +298,7 @@ fn test_format_enumeration(dev_path: &str) -> Result<serde_json::Value> {
     // Check for known bogus formats
     let bogus_count = formats
         .iter()
-        .filter(|f| !f.pixel_format.is_reliable_on_facecam())
+        .filter(|f| quirks::is_format_known_broken(product, firmware, f.pixel_format))
         .count();
 
     Ok(serde_json::json!({
@@ -323,6 +330,8 @@ fn test_format_negotiation(dev_path: &str) -> Result<serde_json::Value> {
     let file = v4l2::open_device(dev_path)?;
     let fd = file.as_raw_fd();
 
+    let (product, firmware) = detect_product_firmware_or_default();
+
     let formats = v4l2::enumerate_formats(fd)?;
     let mut results = Vec::new();
 
@@ -331,7 +340,7 @@ fn test_format_negotiation(dev_path: &str) -> Result<serde_json::Value> {
         results.push(serde_json::json!({
             "format": fmt.pixel_format.fourcc_str(),
             "negotiation_ok": success,
-            "expected_reliable": fmt.pixel_format.is_reliable_on_facecam(),
+            "expected_reliable": !quirks::is_format_known_broken(product, firmware, fmt.pixel_format),
         }));
     }
 
@@ -593,6 +602,17 @@ fn print_single_result(result: &TestResult, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn detect_product_firmware_or_default() -> (ElgatoProduct, FirmwareVersion) {
+    usb::enumerate_elgato_devices()
+        .ok()
+        .and_then(|devs| devs.into_iter().find(|d| d.product.is_facecam_original()))
+        .map(|d| (d.product, d.firmware))
+        .unwrap_or((
+            ElgatoProduct::Facecam,
+            FirmwareVersion { major: 0, minor: 0 },
+        ))
 }
 
 fn resolve_device(device: &Option<String>) -> Result<String> {

@@ -52,13 +52,6 @@ impl PixelFormat {
             Self::Unknown(_) => None,
         }
     }
-
-    /// Whether this format is known to produce valid frames on the Facecam.
-    /// Based on empirical testing: UYVY and MJPEG are the actual working formats.
-    /// YUYV is also accepted since the device may report either byte order.
-    pub fn is_reliable_on_facecam(&self) -> bool {
-        matches!(self, Self::Yuyv | Self::Uyvy | Self::Mjpeg)
-    }
 }
 
 impl fmt::Display for PixelFormat {
