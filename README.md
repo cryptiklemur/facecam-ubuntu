@@ -35,6 +35,13 @@ The Elgato Facecam (USB `0fd9:0078`) enumerates as a standard UVC device on Linu
 | No MJPEG on old firmware | Chromium/Electron apps can't negotiate |
 | USB 2.0 fallback mode | PID changes to `0x0077`, no video at all |
 
+Also supports the Elgato Facecam Pro (USB `0fd9:0079`). The Pro has its own quirks, empirically observed on firmware 0.06:
+
+| Quirk | Impact | Mitigation |
+|-------|--------|------------|
+| `PRO_STREAM_START_RACE` | First STREAMON after open intermittently produces no frames | auto-handled by daemon recovery ladder |
+| `PRO_USB_RESET_DESTRUCTIVE` | Issuing a USB reset mid-stream tears down the pipeline and forces full re-enumeration | auto-handled by daemon recovery ladder |
+
 Every workaround in this project traces to a specific observed device behavior. No speculative mitigations.
 
 ## The Solution
@@ -51,6 +58,16 @@ Physical Facecam (/dev/video0)
         |
    Any application         # OBS, Chrome, Zoom, Teams, etc.
 ```
+
+## Recovery ladder
+
+When the Pro misbehaves mid-stream, the daemon escalates through three rungs, stopping at the first one that restores frames:
+
+1. **In-place STREAMOFF/STREAMON** - toggle streaming on the existing fd. Cheapest and fixes most stream-start races.
+2. **Close + reopen pipeline** - tear down the v4l2 fd, reopen the device node, renegotiate format, resume capture.
+3. **USB reset via sysfs `authorized` flag** - last resort. Writes `0` then `1` to the device's `authorized` attribute, forcing a full re-enumeration. Destructive on the Pro (see `PRO_USB_RESET_DESTRUCTIVE`), so the daemon only reaches this rung after the first two fail.
+
+Every Pro mitigation is documented with the experiment that produced it - run `cargo doc --open` for full quirk descriptions.
 
 ## Install
 
