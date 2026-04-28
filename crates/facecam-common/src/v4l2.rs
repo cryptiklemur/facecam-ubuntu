@@ -21,6 +21,9 @@ mod consts {
     pub const VIDIOC_QUERYMENU: u64 = 0xC0445625;
     pub const VIDIOC_ENUM_FRAMESIZES: u64 = 0xC02C564A;
     pub const VIDIOC_ENUM_FRAMEINTERVALS: u64 = 0xC034564B;
+    pub const VIDIOC_QUERYBUF: u64 = 0xC0585609;
+    pub const VIDIOC_QBUF: u64 = 0xC058560F;
+    pub const VIDIOC_DQBUF: u64 = 0xC0585611;
 
     pub const V4L2_BUF_TYPE_VIDEO_CAPTURE: u32 = 1;
     pub const V4L2_BUF_TYPE_VIDEO_OUTPUT: u32 = 2;
@@ -450,6 +453,98 @@ pub fn stream_off(fd: RawFd, buf_type: u32) -> Result<()> {
 fn read_fixed_string(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).to_string()
+}
+
+/// Open a V4L2 device with O_NONBLOCK set so poll(2) drives timing.
+pub fn open_device_nonblocking(path: &str) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("Failed to open V4L2 device (nonblocking): {}", path))
+}
+
+/// QUERYBUF — returns (length, offset) for one MMAP buffer.
+/// Uses struct v4l2_buffer (88 bytes on x86_64 Linux 6.x). Field offsets
+/// verified via offsetof against linux/videodev2.h on Linux 6.19:
+/// index=0 type=4 bytesused=8 flags=12 field=16 timestamp=24 timecode=40
+/// sequence=56 memory=60 m.offset=64 length=72.
+pub fn query_buffer(fd: RawFd, index: u32, buf_type: u32) -> Result<(u32, u32)> {
+    let mut buf = [0u8; 88];
+    buf[0..4].copy_from_slice(&index.to_ne_bytes()); // index
+    buf[4..8].copy_from_slice(&buf_type.to_ne_bytes()); // type
+    buf[60..64].copy_from_slice(&consts::V4L2_MEMORY_MMAP.to_ne_bytes()); // memory
+    unsafe { v4l2_ioctl(fd, consts::VIDIOC_QUERYBUF, buf.as_mut_ptr())? };
+    let offset = u32::from_ne_bytes(buf[64..68].try_into()?); // m.offset (mmap)
+    let length = u32::from_ne_bytes(buf[72..76].try_into()?); // length
+    Ok((length, offset))
+}
+
+/// QBUF — enqueue a buffer for capture.
+pub fn queue_buffer(fd: RawFd, index: u32, buf_type: u32) -> Result<()> {
+    let mut buf = [0u8; 88];
+    buf[0..4].copy_from_slice(&index.to_ne_bytes()); // index
+    buf[4..8].copy_from_slice(&buf_type.to_ne_bytes()); // type
+    buf[60..64].copy_from_slice(&consts::V4L2_MEMORY_MMAP.to_ne_bytes()); // memory
+    unsafe { v4l2_ioctl(fd, consts::VIDIOC_QBUF, buf.as_mut_ptr())? };
+    Ok(())
+}
+
+/// DQBUF — dequeue a filled buffer; returns (index, bytesused, sequence, ts_ms).
+pub fn dequeue_buffer(fd: RawFd, buf_type: u32) -> Result<(u32, u32, u32, u64)> {
+    let mut buf = [0u8; 88];
+    buf[4..8].copy_from_slice(&buf_type.to_ne_bytes()); // type
+    buf[60..64].copy_from_slice(&consts::V4L2_MEMORY_MMAP.to_ne_bytes()); // memory
+    unsafe { v4l2_ioctl(fd, consts::VIDIOC_DQBUF, buf.as_mut_ptr())? };
+    let index = u32::from_ne_bytes(buf[0..4].try_into()?); // index
+    let bytesused = u32::from_ne_bytes(buf[8..12].try_into()?); // bytesused
+    let secs = i64::from_ne_bytes(buf[24..32].try_into()?); // timestamp.tv_sec
+    let sequence = u32::from_ne_bytes(buf[56..60].try_into()?); // sequence
+    let ts_ms = (secs as u64) * 1000;
+    Ok((index, bytesused, sequence, ts_ms))
+}
+
+/// mmap a buffer returned by QUERYBUF. Returns a *mut u8 pointing at length bytes.
+/// Caller is responsible for munmap_buffer when done.
+pub fn mmap_buffer(fd: RawFd, length: u32, offset: u32) -> Result<*mut u8> {
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            length as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            offset as i64,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error()).context("mmap");
+    }
+    Ok(ptr as *mut u8)
+}
+
+pub fn munmap_buffer(ptr: *mut u8, length: u32) -> Result<()> {
+    let r = unsafe { libc::munmap(ptr as *mut libc::c_void, length as usize) };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error()).context("munmap");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod mmap_helper_tests {
+    use super::*;
+
+    #[test]
+    fn open_device_nonblocking_returns_o_nonblock_fd() {
+        use std::os::unix::io::AsRawFd;
+        let f = open_device_nonblocking("/dev/null").expect("open");
+        let flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_NONBLOCK, libc::O_NONBLOCK);
+    }
 }
 
 /// Common control name to ID mapping
