@@ -533,20 +533,6 @@ pub fn munmap_buffer(ptr: *mut u8, length: u32) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod mmap_helper_tests {
-    use super::*;
-
-    #[test]
-    fn open_device_nonblocking_returns_o_nonblock_fd() {
-        use std::os::unix::io::AsRawFd;
-        let f = open_device_nonblocking("/dev/null").expect("open");
-        let flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) };
-        assert!(flags >= 0);
-        assert_eq!(flags & libc::O_NONBLOCK, libc::O_NONBLOCK);
-    }
-}
-
 /// Common control name to ID mapping
 pub fn control_name_to_id(name: &str) -> Option<u32> {
     match name.to_lowercase().as_str() {
@@ -564,5 +550,19 @@ pub fn control_name_to_id(name: &str) -> Option<u32> {
         "power_line_frequency" | "anti_flicker" => Some(V4L2_CID_BASE + 24),
         "gain" => Some(V4L2_CID_BASE + 19),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod mmap_helper_tests {
+    use super::*;
+
+    #[test]
+    fn open_device_nonblocking_returns_o_nonblock_fd() {
+        use std::os::unix::io::AsRawFd;
+        let f = open_device_nonblocking("/dev/null").expect("open");
+        let flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_NONBLOCK, libc::O_NONBLOCK);
     }
 }
