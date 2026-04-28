@@ -161,14 +161,11 @@ fn cmd_full(cli: &Cli) -> Result<()> {
 
     if test_applies(product, pro_only) {
         let dp = dev_path.clone();
-        tests.push(run_test("pro_nv12_known_broken", move || {
-            test_pro_nv12_known_broken(&dp)
+        tests.push(run_test("pro_nv12_recovers", move || {
+            test_pro_nv12_recovers(&dp)
         }));
     } else {
-        println!(
-            "  [SKIP] pro_nv12_known_broken (does not apply to {})",
-            product
-        );
+        println!("  [SKIP] pro_nv12_recovers (does not apply to {})", product);
     }
 
     if test_applies(product, pro_only) {
@@ -599,64 +596,63 @@ fn test_usb_recovery() -> Result<serde_json::Value> {
 // === Pro-only tests ===
 
 fn test_pro_h264_probe(dev_path: &str) -> Result<serde_json::Value> {
-    use facecam_common::formats::{PixelFormat, VideoMode};
-    use facecam_daemon::capture::CaptureSession;
-
-    let f = v4l2::open_device_nonblocking(dev_path)?;
-    let fd = f.as_raw_fd();
-    v4l2::set_format(fd, 1920, 1080, PixelFormat::H264.to_fourcc())?;
-    let mut session = CaptureSession::start(
-        fd,
-        VideoMode {
-            format: PixelFormat::H264,
-            width: 1920,
-            height: 1080,
-            fps_numerator: 1,
-            fps_denominator: 30,
-        },
-    )?;
-    let mut frames = 0;
-    for _ in 0..5 {
-        if session.next_frame(Duration::from_millis(1000)).is_ok() {
-            frames += 1;
-        }
-    }
-    session.stop()?;
-    if frames < 3 {
-        anyhow::bail!("only {}/5 H.264 frames received", frames);
-    }
-    Ok(serde_json::json!({ "frames_received": frames }))
+    probe_pro_format_with_recovery(dev_path, PixelFormat::H264, 1920, 1080)
 }
 
-fn test_pro_nv12_known_broken(dev_path: &str) -> Result<serde_json::Value> {
-    use facecam_common::formats::{PixelFormat, VideoMode};
+fn test_pro_nv12_recovers(dev_path: &str) -> Result<serde_json::Value> {
+    // The Pro was originally suspected of BOGUS_NV12 (0 bytes for NV12) but
+    // on 2026-04-28 NV12 was observed to deliver valid frames after a single
+    // STREAM_START_RACE recovery cycle. This test asserts the recovery path
+    // works for NV12 just like it does for MJPG and H.264.
+    probe_pro_format_with_recovery(dev_path, PixelFormat::Nv12, 1920, 1080)
+}
+
+fn probe_pro_format_with_recovery(
+    dev_path: &str,
+    fmt: PixelFormat,
+    width: u32,
+    height: u32,
+) -> Result<serde_json::Value> {
+    use facecam_common::formats::VideoMode;
     use facecam_daemon::capture::CaptureSession;
 
     let f = v4l2::open_device_nonblocking(dev_path)?;
     let fd = f.as_raw_fd();
-    v4l2::set_format(fd, 1920, 1080, PixelFormat::Nv12.to_fourcc())?;
-    let mut session = match CaptureSession::start(
-        fd,
-        VideoMode {
-            format: PixelFormat::Nv12,
-            width: 1920,
-            height: 1080,
-            fps_numerator: 1,
-            fps_denominator: 30,
-        },
-    ) {
-        Ok(s) => s,
-        // STREAMON failure is also acceptable broken-state for BOGUS_NV12.
-        Err(_) => return Ok(serde_json::json!({ "result": "streamon_failed" })),
+    v4l2::set_format(fd, width, height, fmt.to_fourcc())?;
+    let mode = VideoMode {
+        format: fmt,
+        width,
+        height,
+        fps_numerator: 1,
+        fps_denominator: 30,
     };
-    let got_frame = session.next_frame(Duration::from_millis(2000)).is_ok();
-    session.stop()?;
-    if got_frame {
-        anyhow::bail!(
-            "NV12 unexpectedly produced a frame on the Pro (BOGUS_NV12 quirk should hold)"
-        );
+    for attempt in 1..=2 {
+        let mut session = CaptureSession::start(fd, mode)?;
+        let mut frames = 0;
+        for _ in 0..5 {
+            if session.next_frame(Duration::from_millis(1000)).is_ok() {
+                frames += 1;
+            }
+        }
+        session.stop()?;
+        if frames >= 3 {
+            return Ok(serde_json::json!({
+                "format": fmt.to_string(),
+                "frames_received": frames,
+                "attempts": attempt,
+            }));
+        }
+        if attempt == 2 {
+            anyhow::bail!(
+                "{} probe at {}x{} failed both attempts (got {} frames on attempt 2)",
+                fmt,
+                width,
+                height,
+                frames
+            );
+        }
     }
-    Ok(serde_json::json!({ "result": "no_frames_as_expected" }))
+    anyhow::bail!("unreachable")
 }
 
 fn test_pro_stream_start_recovery(dev_path: &str) -> Result<serde_json::Value> {
