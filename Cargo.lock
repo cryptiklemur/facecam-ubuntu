@@ -333,6 +333,7 @@ dependencies = [
  "anyhow",
  "clap",
  "facecam-common",
+ "facecam-daemon",
  "rusb",
  "serde",
  "serde_json",

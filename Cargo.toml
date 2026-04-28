@@ -20,6 +20,7 @@ authors = ["Facecam Ubuntu Runtime"]
 
 [workspace.dependencies]
 facecam-common = { path = "crates/facecam-common" }
+facecam-daemon = { path = "crates/facecam-daemon" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

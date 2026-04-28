@@ -20,6 +20,8 @@ pub struct DiagnosticsBundle {
     pub kernel_modules: KernelModuleInfo,
     pub recent_events: Vec<DiagnosticEvent>,
     pub config_files: Vec<ConfigFile>,
+    #[serde(default)]
+    pub format_probes: Vec<crate::formats::FormatProbeResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +204,7 @@ pub fn create_bundle(
         kernel_modules: collect_kernel_module_info(),
         recent_events: events,
         config_files: collect_config_files(),
+        format_probes: Vec::new(),
     }
 }
 

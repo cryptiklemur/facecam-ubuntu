@@ -56,7 +56,15 @@ enum Commands {
     /// Show applicable quirks for the detected device
     Quirks,
     /// Run full system diagnostics
-    Diagnostics,
+    Diagnostics {
+        /// V4L2 device path (auto-detected if omitted)
+        #[arg(long)]
+        device: Option<String>,
+        /// Cycle each advertised format through a brief STREAMON to record an
+        /// empirical FormatVerdict. Disrupts the device — use with care.
+        #[arg(long)]
+        probe_formats: bool,
+    },
     /// Probe all formats and validate actual frame delivery
     Validate {
         /// V4L2 device path (auto-detected if omitted)
@@ -83,7 +91,10 @@ fn main() -> Result<()> {
         Commands::Controls { device } => cmd_controls(device, cli.format),
         Commands::Topology => cmd_topology(cli.format),
         Commands::Quirks => cmd_quirks(cli.format),
-        Commands::Diagnostics => cmd_diagnostics(cli.format),
+        Commands::Diagnostics {
+            device,
+            probe_formats,
+        } => cmd_diagnostics(device, probe_formats, cli.format),
         Commands::Validate { device } => cmd_validate(device, cli.format),
     }
 }
@@ -395,18 +406,22 @@ fn print_quirk(q: &quirks::Quirk) {
     println!();
 }
 
-fn cmd_diagnostics(format: OutputFormat) -> Result<()> {
+fn cmd_diagnostics(
+    device: Option<String>,
+    probe_formats: bool,
+    format: OutputFormat,
+) -> Result<()> {
     println!("Collecting diagnostics...\n");
 
     let system = diagnostics::collect_system_info();
     let modules = diagnostics::collect_kernel_module_info();
     let v4l2_devs = diagnostics::list_v4l2_devices();
 
-    let resolved = resolve_target(None).ok();
+    let resolved = resolve_target(device.as_deref()).ok();
 
-    let (device_opt, controls, topology) = match resolved {
+    let (device_opt, controls, topology, device_path_opt) = match &resolved {
         Some((fp, dev_path)) => {
-            let controls = v4l2::open_device(&dev_path)
+            let controls = v4l2::open_device(dev_path)
                 .ok()
                 .and_then(|file| v4l2::enumerate_controls(file.as_raw_fd()).ok())
                 .unwrap_or_default();
@@ -414,15 +429,36 @@ fn cmd_diagnostics(format: OutputFormat) -> Result<()> {
                 .v4l2_sysfs_path
                 .as_ref()
                 .and_then(|p| usb::read_usb_topology(&PathBuf::from(p)).ok());
-            (Some(fp), controls, topology)
+            (Some(fp.clone()), controls, topology, Some(dev_path.clone()))
         }
-        None => (None, Vec::new(), None),
+        None => (None, Vec::new(), None, None),
     };
 
     let mut bundle = diagnostics::create_bundle(device_opt, None, controls, Vec::new());
     if let Some(topo) = topology {
         if let Ok(val) = serde_json::to_value(&topo) {
             bundle.usb_topology = Some(val);
+        }
+    }
+
+    if probe_formats {
+        if let Some(ref device_path) = device_path_opt {
+            let mut modes = v4l2::open_device_nonblocking(device_path)
+                .ok()
+                .and_then(|f| v4l2::enumerate_all_modes(f.as_raw_fd()).ok())
+                .unwrap_or_default();
+
+            // Probe the smallest resolution per format - V4L2 enumeration order
+            // isn't guaranteed and the Pro lists heaviest-first, which makes the
+            // 2s probe window unreliable for high-bandwidth modes like H264 4Kp60.
+            modes.sort_by_key(|m| (m.width as u64) * (m.height as u64));
+
+            let mut probes = Vec::new();
+            let mut seen_formats = std::collections::HashSet::new();
+            for mode in modes.iter().filter(|m| seen_formats.insert(m.format)) {
+                probes.push(probe_one_mode(device_path, *mode));
+            }
+            bundle.format_probes = probes;
         }
     }
 
@@ -474,6 +510,77 @@ fn cmd_diagnostics(format: OutputFormat) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn probe_one_mode(
+    device: &str,
+    mode: facecam_common::formats::VideoMode,
+) -> facecam_common::formats::FormatProbeResult {
+    use facecam_common::formats::{FormatProbeResult, FormatVerdict};
+    use facecam_daemon::capture::CaptureSession;
+    use std::time::{Duration, Instant};
+
+    let mut r = FormatProbeResult {
+        mode,
+        negotiation_ok: false,
+        stream_started: false,
+        frames_received: 0,
+        first_frame_nonzero: false,
+        frame_size_consistent: true,
+        avg_frame_interval_ms: None,
+        error: None,
+        verdict: FormatVerdict::Untested,
+    };
+
+    let f = match v4l2::open_device_nonblocking(device) {
+        Ok(f) => f,
+        Err(e) => {
+            r.error = Some(format!("open: {}", e));
+            return r;
+        }
+    };
+    let fd = f.as_raw_fd();
+
+    if let Err(e) = v4l2::set_format(fd, mode.width, mode.height, mode.format.to_fourcc()) {
+        r.error = Some(format!("S_FMT: {}", e));
+        r.verdict = FormatVerdict::NegotiationFailed;
+        return r;
+    }
+    r.negotiation_ok = true;
+
+    let mut session = match CaptureSession::start(fd, mode) {
+        Ok(s) => s,
+        Err(e) => {
+            r.error = Some(format!("STREAMON: {}", e));
+            return r;
+        }
+    };
+    r.stream_started = true;
+
+    let start = Instant::now();
+    let mut sizes: Vec<usize> = Vec::new();
+    while start.elapsed() < Duration::from_secs(2) && sizes.len() < 5 {
+        match session.next_frame(Duration::from_millis(1000)) {
+            Ok(frame) => {
+                if !frame.bytes.is_empty() {
+                    r.first_frame_nonzero = true;
+                }
+                sizes.push(frame.bytes.len());
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = session.stop();
+
+    r.frames_received = sizes.len() as u32;
+    r.frame_size_consistent = sizes.windows(2).all(|w| w[0].abs_diff(w[1]) < w[0] / 2);
+    r.verdict = match (r.frames_received, r.first_frame_nonzero) {
+        (0, _) => FormatVerdict::NoFrames,
+        (_, true) if !r.frame_size_consistent => FormatVerdict::Unstable,
+        (_, true) => FormatVerdict::Working,
+        _ => FormatVerdict::GarbageFrames,
+    };
+    r
 }
 
 fn cmd_validate(device: Option<String>, format: OutputFormat) -> Result<()> {
