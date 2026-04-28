@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, watch, Mutex};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Run the IPC server on a Unix domain socket
 pub async fn run(
@@ -124,7 +124,16 @@ async fn handle_command(
         }
 
         DaemonCommand::ApplyProfile { name } => {
-            match profiles::load_profile(&name) {
+            let family = match status_rx.borrow().product_family.clone() {
+                Some(f) => f,
+                None => {
+                    warn!(
+                        "ApplyProfile called before product family was detected; falling back to 'facecam'"
+                    );
+                    "facecam".to_string()
+                }
+            };
+            match profiles::load_profile_for_family(&name, &family) {
                 Ok(profile) => {
                     // Apply controls if we have a source device
                     let status = status_rx.borrow().clone();

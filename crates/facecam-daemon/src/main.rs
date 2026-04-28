@@ -96,6 +96,8 @@ async fn main() -> Result<()> {
         source_device: cli.source.clone(),
         sink_device: Some(cli.sink.clone()),
         active_profile: Some(cli.profile.clone()),
+        product: None,
+        product_family: None,
     };
 
     let (status_tx, status_rx) = watch::channel(initial_status);

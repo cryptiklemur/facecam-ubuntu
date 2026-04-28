@@ -74,6 +74,10 @@ pub struct DaemonStatus {
     pub source_device: Option<String>,
     pub sink_device: Option<String>,
     pub active_profile: Option<String>,
+    #[serde(default)]
+    pub product: Option<String>,
+    #[serde(default)]
+    pub product_family: Option<String>,
 }
 
 /// V4L2 control value

@@ -137,6 +137,11 @@ fn run_pipeline_once(
     let (source_path, product, firmware) = detect_source(&config.source_device)?;
     info!(source = %source_path, product = %product, firmware = %firmware, "Source device detected");
     update_source(status_tx, Some(source_path.clone()));
+    update_product(
+        status_tx,
+        Some(product.to_string()),
+        Some(product.family().to_string()),
+    );
 
     let source_file = v4l2::open_device_nonblocking(&source_path)
         .with_context(|| format!("Failed to open {} ({})", product, source_path))?;
@@ -397,6 +402,19 @@ fn update_error(tx: &Arc<Mutex<watch::Sender<DaemonStatus>>>, error: Option<Stri
 fn update_source(tx: &Arc<Mutex<watch::Sender<DaemonStatus>>>, source: Option<String>) {
     if let Ok(guard) = tx.try_lock() {
         guard.send_modify(|s| s.source_device = source);
+    }
+}
+
+fn update_product(
+    tx: &Arc<Mutex<watch::Sender<DaemonStatus>>>,
+    product: Option<String>,
+    family: Option<String>,
+) {
+    if let Ok(guard) = tx.try_lock() {
+        guard.send_modify(|s| {
+            s.product = product;
+            s.product_family = family;
+        });
     }
 }
 

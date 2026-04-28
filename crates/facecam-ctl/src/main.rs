@@ -96,6 +96,9 @@ async fn main() -> Result<()> {
                     } else {
                         println!("=== Facecam Daemon Status ===\n");
                         println!("  State:          {}", status.state);
+                        if let Some(ref p) = status.product {
+                            println!("  Product:        {}", p);
+                        }
                         println!("  Health:         {}", status.health);
                         println!("  Uptime:         {}s", status.uptime_secs);
                         println!("  Connected:      {}", status.device_connected);
@@ -211,8 +214,11 @@ async fn main() -> Result<()> {
                     if profiles.is_empty() {
                         println!("  (none — run 'facecam-ctl profile init' to create defaults)");
                     } else {
+                        let family = family_from_daemon().await;
                         for name in &profiles {
-                            if let Ok(p) = facecam_common::profiles::load_profile(name) {
+                            if let Ok(p) =
+                                facecam_common::profiles::load_profile_for_family(name, &family)
+                            {
                                 println!("  {:15} — {}", name, p.description);
                             } else {
                                 println!("  {}", name);
@@ -222,7 +228,8 @@ async fn main() -> Result<()> {
                 }
             }
             ProfileAction::Show { name } => {
-                let profile = facecam_common::profiles::load_profile(&name)?;
+                let family = family_from_daemon().await;
+                let profile = facecam_common::profiles::load_profile_for_family(&name, &family)?;
                 if cli.json {
                     println!("{}", serde_json::to_string_pretty(&profile)?);
                 } else {
@@ -281,6 +288,16 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Ask the running daemon which product family it has resolved. Falls back to
+/// `facecam` when the daemon is unreachable or has not yet detected a device,
+/// preserving original-Facecam behavior on machines without a Pro.
+async fn family_from_daemon() -> String {
+    match send_command(DaemonCommand::Status).await {
+        Ok(DaemonResponse::Status(s)) => s.product_family.unwrap_or_else(|| "facecam".to_string()),
+        _ => "facecam".to_string(),
+    }
 }
 
 /// Send a command to the daemon via Unix socket and read the response
