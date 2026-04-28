@@ -1,12 +1,13 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use facecam_common::{
-    device::{ElgatoProduct, FirmwareVersion, UsbSpeed},
+    device::UsbSpeed,
     diagnostics,
     formats::{FormatVerdict, VideoMode},
     quirks, usb, v4l2,
 };
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "facecam-probe")]
@@ -32,8 +33,12 @@ enum OutputFormat {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Detect and fingerprint all Elgato cameras
-    Detect,
+    /// Detect and fingerprint Elgato cameras
+    Detect {
+        /// V4L2 device path (auto-detected if omitted)
+        #[arg(long)]
+        device: Option<String>,
+    },
     /// Enumerate all video formats and frame modes
     Formats {
         /// V4L2 device path (auto-detected if omitted)
@@ -72,8 +77,8 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    match cli.command.unwrap_or(Commands::Detect) {
-        Commands::Detect => cmd_detect(cli.format),
+    match cli.command.unwrap_or(Commands::Detect { device: None }) {
+        Commands::Detect { device } => cmd_detect(device, cli.format),
         Commands::Formats { device } => cmd_formats(device, cli.format),
         Commands::Controls { device } => cmd_controls(device, cli.format),
         Commands::Topology => cmd_topology(cli.format),
@@ -83,43 +88,95 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_detect(format: OutputFormat) -> Result<()> {
-    let devices = usb::enumerate_elgato_devices()?;
+fn resolve_target(
+    explicit_device: Option<&str>,
+) -> anyhow::Result<(facecam_common::device::DeviceFingerprint, String)> {
+    use facecam_common::device::{
+        DeviceFingerprint, ElgatoProduct, FirmwareVersion, ProductDescriptor, UsbSpeed,
+    };
 
-    if devices.is_empty() {
-        if format == OutputFormat::Json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "found": false,
-                    "devices": []
-                }))?
-            );
-        } else {
-            println!("No Elgato cameras detected.");
-            println!();
-            println!("Troubleshooting:");
-            println!("  1. Check USB connection (USB 3.0 required for Facecam)");
-            println!("  2. Run 'lsusb' to verify the device is visible to the kernel");
-            println!("  3. Check 'dmesg | tail -20' for USB errors");
+    if let Some(dev) = explicit_device {
+        if std::path::Path::new(dev).exists() {
+            for cam in usb::enumerate_uvc_capture_devices()? {
+                if cam.v4l2_device.as_deref() == Some(dev) {
+                    return Ok((cam, dev.to_string()));
+                }
+            }
+            return Ok((
+                DeviceFingerprint {
+                    product: ElgatoProduct::Unknown(0),
+                    firmware: FirmwareVersion { major: 0, minor: 0 },
+                    serial: String::new(),
+                    usb_bus: 0,
+                    usb_address: 0,
+                    usb_port_numbers: vec![],
+                    usb_speed: UsbSpeed::Unknown,
+                    v4l2_device: Some(dev.to_string()),
+                    v4l2_sysfs_path: None,
+                    driver_version: None,
+                    card_name: None,
+                },
+                dev.to_string(),
+            ));
         }
-        return Ok(());
+        anyhow::bail!("--device {} does not exist", dev);
     }
 
-    // Enrich with V4L2 info (skip for non-functional fallback devices)
-    let mut enriched = Vec::new();
-    for mut dev in devices {
-        if dev.product.is_usb2_fallback() {
-            enriched.push(dev);
-            continue;
-        }
-        if let Ok(Some(sysfs)) = usb::find_usb_sysfs_path(dev.usb_bus, dev.usb_address) {
-            dev.v4l2_sysfs_path = Some(sysfs.to_string_lossy().to_string());
-            if let Ok(Some(v4l2_dev)) = usb::find_v4l2_device_for_usb(&sysfs) {
-                dev.v4l2_device = Some(v4l2_dev.clone());
+    let cams = usb::enumerate_uvc_capture_devices()?;
+    if let Some(cam) = cams
+        .iter()
+        .find(|c| c.product.is_uvc_capture() && c.v4l2_device.is_some())
+    {
+        let dev = cam.v4l2_device.clone().unwrap();
+        return Ok((cam.clone(), dev));
+    }
 
-                // Try to get card name from V4L2
-                if let Ok(file) = v4l2::open_device(&v4l2_dev) {
+    let symlink = "/dev/video-facecam";
+    if std::path::Path::new(symlink).exists() {
+        return Ok((
+            DeviceFingerprint {
+                product: ElgatoProduct::Facecam,
+                firmware: FirmwareVersion { major: 0, minor: 0 },
+                serial: String::new(),
+                usb_bus: 0,
+                usb_address: 0,
+                usb_port_numbers: vec![],
+                usb_speed: UsbSpeed::Unknown,
+                v4l2_device: Some(symlink.into()),
+                v4l2_sysfs_path: None,
+                driver_version: None,
+                card_name: None,
+            },
+            symlink.into(),
+        ));
+    }
+
+    let elgatos = usb::enumerate_elgato_devices().unwrap_or_default();
+    let connected: Vec<String> = elgatos.iter().map(|d| format!("{}", d.product)).collect();
+    anyhow::bail!(
+        "No Elgato UVC capture device found. Connected Elgato devices: {:?}",
+        connected
+    );
+}
+
+fn cmd_detect(device: Option<String>, format: OutputFormat) -> Result<()> {
+    let (mut dev, _path) = resolve_target(device.as_deref())?;
+
+    // Enrich with V4L2 info if not already populated and not a USB2 fallback
+    if !dev.product.is_usb2_fallback() {
+        if dev.v4l2_sysfs_path.is_none() {
+            if let Ok(Some(sysfs)) = usb::find_usb_sysfs_path(dev.usb_bus, dev.usb_address) {
+                dev.v4l2_sysfs_path = Some(sysfs.to_string_lossy().to_string());
+                if dev.v4l2_device.is_none() {
+                    if let Ok(Some(v4l2_dev)) = usb::find_v4l2_device_for_usb(&sysfs) {
+                        dev.v4l2_device = Some(v4l2_dev);
+                    }
+                }
+            }
+        }
+        if let Some(ref v4l2_dev) = dev.v4l2_device {
+            if dev.card_name.is_none() {
+                if let Ok(file) = v4l2::open_device(v4l2_dev) {
                     if let Ok(caps) = v4l2::query_capabilities(file.as_raw_fd()) {
                         dev.card_name = Some(caps.card.clone());
                         dev.driver_version = Some(caps.version_string());
@@ -127,54 +184,50 @@ fn cmd_detect(format: OutputFormat) -> Result<()> {
                 }
             }
         }
-        enriched.push(dev);
     }
 
     if format == OutputFormat::Json {
-        println!("{}", serde_json::to_string_pretty(&enriched)?);
+        println!("{}", serde_json::to_string_pretty(&dev)?);
     } else {
         println!("=== Elgato Camera Detection ===\n");
-        for dev in &enriched {
-            print!("{}", dev);
+        print!("{}", dev);
 
-            // USB 2.0 fallback mode — critical error
-            if dev.product.is_usb2_fallback() {
-                println!("  CRITICAL: Facecam is in USB 2.0 fallback mode (PID 0x0077).");
-                println!("            The device string says \"USB3-REQUIRED-FOR-FACECAM\".");
-                println!(
-                    "            It will NOT function as a camera until moved to a USB 3.0 port."
-                );
-                println!("            Look for a blue USB-A port or a USB-C/Thunderbolt port.");
-            }
-
-            // Firmware warnings
-            if dev.product.is_facecam_original() && !dev.firmware.has_mjpeg() {
-                println!("  WARNING: Firmware {} lacks MJPEG support.", dev.firmware);
-                println!("           Chromium-based browsers will NOT work without v4l2loopback.");
-                println!("           Update to firmware 4.03+ via Camera Hub (Windows/Mac).");
-            }
-
-            // Speed warning
-            if matches!(
-                dev.usb_speed,
-                UsbSpeed::High | UsbSpeed::Full | UsbSpeed::Low
-            ) {
-                println!("  WARNING: Device on USB 2.0 or lower. USB 3.0 is required.");
-            }
-
-            println!();
+        // USB 2.0 fallback mode — critical error
+        if dev.product.is_usb2_fallback() {
+            println!("  CRITICAL: Facecam is in USB 2.0 fallback mode (PID 0x0077).");
+            println!("            The device string says \"USB3-REQUIRED-FOR-FACECAM\".");
+            println!("            It will NOT function as a camera until moved to a USB 3.0 port.");
+            println!("            Look for a blue USB-A port or a USB-C/Thunderbolt port.");
         }
+
+        // Firmware warnings
+        if dev.product.is_facecam_original() && !dev.firmware.has_mjpeg() {
+            println!("  WARNING: Firmware {} lacks MJPEG support.", dev.firmware);
+            println!("           Chromium-based browsers will NOT work without v4l2loopback.");
+            println!("           Update to firmware 4.03+ via Camera Hub (Windows/Mac).");
+        }
+
+        // Speed warning
+        if matches!(
+            dev.usb_speed,
+            UsbSpeed::High | UsbSpeed::Full | UsbSpeed::Low
+        ) {
+            println!("  WARNING: Device on USB 2.0 or lower. USB 3.0 is required.");
+        }
+
+        println!();
     }
 
     Ok(())
 }
 
 fn cmd_formats(device: Option<String>, format: OutputFormat) -> Result<()> {
-    let dev_path = resolve_device(device)?;
+    let (fingerprint, dev_path) = resolve_target(device.as_deref())?;
     let file = v4l2::open_device(&dev_path)?;
     let fd = file.as_raw_fd();
 
-    let (product, firmware) = detect_product_firmware_or_default();
+    let product = fingerprint.product;
+    let firmware = fingerprint.firmware;
 
     let formats = v4l2::enumerate_formats(fd)?;
     let modes = v4l2::enumerate_all_modes(fd)?;
@@ -193,14 +246,14 @@ fn cmd_formats(device: Option<String>, format: OutputFormat) -> Result<()> {
 
         println!("Pixel Formats:");
         for fmt in &formats {
-            let reliable = if quirks::is_format_known_broken(product, firmware, fmt.pixel_format) {
-                " [KNOWN BROKEN - see quirk registry]"
+            let label = if quirks::is_format_known_broken(product, firmware, fmt.pixel_format) {
+                "[BROKEN]"
             } else {
-                " [UNTESTED]"
+                "[UNTESTED]"
             };
             println!(
-                "  [{}] {} - {}{}",
-                fmt.index, fmt.pixel_format, fmt.description, reliable
+                "  [{}] {} - {} {}",
+                fmt.index, fmt.pixel_format, fmt.description, label
             );
         }
 
@@ -210,12 +263,12 @@ fn cmd_formats(device: Option<String>, format: OutputFormat) -> Result<()> {
                 .bandwidth_bytes_per_sec()
                 .map(|b| format!(" ({:.0} MB/s)", b as f64 / 1_000_000.0))
                 .unwrap_or_default();
-            let reliable = if quirks::is_format_known_broken(product, firmware, mode.format) {
+            let label = if quirks::is_format_known_broken(product, firmware, mode.format) {
                 " [BROKEN]"
             } else {
-                ""
+                " [UNTESTED]"
             };
-            println!("  {}{}{}", mode, bw, reliable);
+            println!("  {}{}{}", mode, bw, label);
         }
     }
 
@@ -223,7 +276,7 @@ fn cmd_formats(device: Option<String>, format: OutputFormat) -> Result<()> {
 }
 
 fn cmd_controls(device: Option<String>, format: OutputFormat) -> Result<()> {
-    let dev_path = resolve_device(device)?;
+    let (_fingerprint, dev_path) = resolve_target(device.as_deref())?;
     let file = v4l2::open_device(&dev_path)?;
     let fd = file.as_raw_fd();
 
@@ -258,8 +311,12 @@ fn cmd_controls(device: Option<String>, format: OutputFormat) -> Result<()> {
 }
 
 fn cmd_topology(format: OutputFormat) -> Result<()> {
-    let (product, _) = detect_product_firmware_or_default();
-    let sysfs = usb::find_elgato_sysfs_path(product)?;
+    let (fingerprint, _dev_path) = resolve_target(None)?;
+
+    let sysfs = match fingerprint.v4l2_sysfs_path.as_ref() {
+        Some(p) => Some(PathBuf::from(p)),
+        None => usb::find_elgato_sysfs_path(fingerprint.product)?,
+    };
 
     match sysfs {
         Some(path) => {
@@ -292,24 +349,22 @@ fn cmd_topology(format: OutputFormat) -> Result<()> {
 }
 
 fn cmd_quirks(format: OutputFormat) -> Result<()> {
-    // Try to detect the device to show applicable quirks
-    let devices = usb::enumerate_elgato_devices()?;
-
-    let (product, firmware) = if let Some(dev) = devices.first() {
-        (dev.product, dev.firmware)
-    } else {
-        // Show all quirks if no device connected
-        if format == OutputFormat::Json {
-            let registry = quirks::quirk_registry();
-            println!("{}", serde_json::to_string_pretty(&registry)?);
-        } else {
-            println!("=== Quirk Registry (all known quirks) ===\n");
-            println!("No device connected — showing complete registry.\n");
-            for q in quirks::quirk_registry() {
-                print_quirk(q);
+    let (product, firmware) = match resolve_target(None) {
+        Ok((fp, _)) => (fp.product, fp.firmware),
+        Err(_) => {
+            // No device connected — show full registry
+            if format == OutputFormat::Json {
+                let registry = quirks::quirk_registry();
+                println!("{}", serde_json::to_string_pretty(&registry)?);
+            } else {
+                println!("=== Quirk Registry (all known quirks) ===\n");
+                println!("No device connected — showing complete registry.\n");
+                for q in quirks::quirk_registry() {
+                    print_quirk(q);
+                }
             }
+            return Ok(());
         }
-        return Ok(());
     };
 
     let applicable = quirks::applicable_quirks(product, firmware);
@@ -347,11 +402,29 @@ fn cmd_diagnostics(format: OutputFormat) -> Result<()> {
     let modules = diagnostics::collect_kernel_module_info();
     let v4l2_devs = diagnostics::list_v4l2_devices();
 
-    // Try to detect device
-    let devices = usb::enumerate_elgato_devices().unwrap_or_default();
-    let device = devices.into_iter().next();
+    let resolved = resolve_target(None).ok();
 
-    let bundle = diagnostics::create_bundle(device, None, Vec::new(), Vec::new());
+    let (device_opt, controls, topology) = match resolved {
+        Some((fp, dev_path)) => {
+            let controls = v4l2::open_device(&dev_path)
+                .ok()
+                .and_then(|file| v4l2::enumerate_controls(file.as_raw_fd()).ok())
+                .unwrap_or_default();
+            let topology = fp
+                .v4l2_sysfs_path
+                .as_ref()
+                .and_then(|p| usb::read_usb_topology(&PathBuf::from(p)).ok());
+            (Some(fp), controls, topology)
+        }
+        None => (None, Vec::new(), None),
+    };
+
+    let mut bundle = diagnostics::create_bundle(device_opt, None, controls, Vec::new());
+    if let Some(topo) = topology {
+        if let Ok(val) = serde_json::to_value(&topo) {
+            bundle.usb_topology = Some(val);
+        }
+    }
 
     if format == OutputFormat::Json {
         println!("{}", serde_json::to_string_pretty(&bundle)?);
@@ -404,7 +477,7 @@ fn cmd_diagnostics(format: OutputFormat) -> Result<()> {
 }
 
 fn cmd_validate(device: Option<String>, format: OutputFormat) -> Result<()> {
-    let dev_path = resolve_device(device)?;
+    let (fingerprint, dev_path) = resolve_target(device.as_deref())?;
     println!("=== Format Validation: {} ===\n", dev_path);
     println!("This will attempt to stream each advertised format and verify frame delivery.");
     println!("The device may need USB resets between tests.\n");
@@ -429,7 +502,7 @@ fn cmd_validate(device: Option<String>, format: OutputFormat) -> Result<()> {
 
         println!("Testing: {} ...", mode);
 
-        let result = validate_single_format(&dev_path, mode);
+        let result = validate_single_format(&dev_path, mode, &fingerprint);
         match &result {
             Ok(r) => {
                 println!("  Result: {}", r.verdict);
@@ -478,6 +551,7 @@ fn cmd_validate(device: Option<String>, format: OutputFormat) -> Result<()> {
 fn validate_single_format(
     dev_path: &str,
     mode: &VideoMode,
+    fingerprint: &facecam_common::device::DeviceFingerprint,
 ) -> Result<facecam_common::formats::FormatProbeResult> {
     let file = v4l2::open_device(dev_path)?;
     let fd = file.as_raw_fd();
@@ -518,12 +592,12 @@ fn validate_single_format(
     // For validation, we just check if the format negotiation succeeds
     // Full streaming validation requires MMAP buffer mapping which is complex
     // For now, report based on known quirk data
-    let (product, firmware) = detect_product_firmware_or_default();
-    let verdict = if quirks::is_format_known_broken(product, firmware, mode.format) {
-        FormatVerdict::GarbageFrames
-    } else {
-        FormatVerdict::Working
-    };
+    let verdict =
+        if quirks::is_format_known_broken(fingerprint.product, fingerprint.firmware, mode.format) {
+            FormatVerdict::GarbageFrames
+        } else {
+            FormatVerdict::Working
+        };
 
     Ok(facecam_common::formats::FormatProbeResult {
         mode: *mode,
@@ -536,50 +610,4 @@ fn validate_single_format(
         error: None,
         verdict,
     })
-}
-
-/// Detect the first connected UVC capture camera, falling back to Facecam.
-/// Accepts both Facecam (0x0078) and FacecamPro (0x0079) — anything that
-/// claims a UVC capture interface — so Pro hardware is correctly identified.
-fn detect_product_firmware_or_default() -> (ElgatoProduct, FirmwareVersion) {
-    use facecam_common::device::ProductDescriptor;
-    usb::enumerate_elgato_devices()
-        .ok()
-        .and_then(|devs| devs.into_iter().find(|d| d.product.is_uvc_capture()))
-        .map(|d| (d.product, d.firmware))
-        .unwrap_or((
-            ElgatoProduct::Facecam,
-            FirmwareVersion { major: 0, minor: 0 },
-        ))
-}
-
-/// Resolve a V4L2 device path — auto-detect if not specified
-fn resolve_device(device: Option<String>) -> Result<String> {
-    if let Some(dev) = device {
-        return Ok(dev);
-    }
-
-    // Try to auto-detect via USB enumeration
-    let devices = usb::enumerate_elgato_devices()?;
-    for dev in &devices {
-        if !dev.product.is_facecam_original() {
-            continue;
-        }
-        if let Ok(Some(sysfs)) = usb::find_usb_sysfs_path(dev.usb_bus, dev.usb_address) {
-            if let Ok(Some(v4l2_dev)) = usb::find_v4l2_device_for_usb(&sysfs) {
-                return Ok(v4l2_dev);
-            }
-        }
-    }
-
-    // Fallback: check for udev symlink
-    let symlink = "/dev/video-facecam";
-    if std::path::Path::new(symlink).exists() {
-        return Ok(symlink.to_string());
-    }
-
-    anyhow::bail!(
-        "Could not auto-detect Facecam V4L2 device. \
-         Use --device /dev/videoN to specify manually."
-    );
 }
