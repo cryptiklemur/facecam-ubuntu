@@ -1,5 +1,7 @@
+use crate::capture::CaptureSession;
 use anyhow::{bail, Context, Result};
 use facecam_common::{
+    device::{ElgatoProduct, FirmwareVersion, ProductDescriptor},
     profiles, quirks, recovery,
     types::{DaemonStatus, HealthStatus, PipelineState},
     usb, v4l2,
@@ -19,24 +21,25 @@ pub struct PipelineConfig {
     pub frame_timeout_ms: u64,
 }
 
-/// Main pipeline loop — runs on a blocking thread.
-///
-/// Architecture:
-///   Physical Facecam (/dev/videoN) -> [capture] -> [frame copy] -> [output] -> v4l2loopback (/dev/video10)
-///
-/// The daemon keeps the physical device open continuously to avoid the open/close lockup bug.
-/// Consumer applications open/close the v4l2loopback device freely.
 pub fn run(
     config: PipelineConfig,
     status_tx: Arc<Mutex<watch::Sender<DaemonStatus>>>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
+    let product = match detect_source(&config.source_device) {
+        Ok((_, p, _)) => p,
+        Err(e) => {
+            error!(error = %e, "Initial source detection failed; entering Failed state");
+            update_state(&status_tx, PipelineState::Failed, HealthStatus::Unhealthy);
+            update_error(&status_tx, Some(e.to_string()));
+            return;
+        }
+    };
+
     let mut recovery_count: u32 = 0;
     let mut consecutive_failures: u32 = 0;
-    let mut last_product: Option<facecam_common::device::ElgatoProduct> = None;
 
     loop {
-        // Check for shutdown
         if shutdown_rx.try_recv().is_ok() {
             info!("Pipeline received shutdown signal");
             update_state(
@@ -47,10 +50,8 @@ pub fn run(
             return;
         }
 
-        // Run one pipeline lifecycle
-        match run_pipeline_once(&config, &status_tx, &mut shutdown_rx, &mut last_product) {
+        match run_pipeline_once(&config, &status_tx, &mut shutdown_rx) {
             Ok(()) => {
-                // Clean shutdown or signal
                 info!("Pipeline exited cleanly");
                 return;
             }
@@ -66,8 +67,6 @@ pub fn run(
                     );
                     update_state(&status_tx, PipelineState::Failed, HealthStatus::Unhealthy);
                     update_error(&status_tx, Some(e.to_string()));
-
-                    // Wait for external intervention or shutdown
                     loop {
                         if shutdown_rx.try_recv().is_ok() {
                             return;
@@ -76,7 +75,6 @@ pub fn run(
                     }
                 }
 
-                // Attempt recovery
                 update_state(
                     &status_tx,
                     PipelineState::Recovering,
@@ -85,25 +83,43 @@ pub fn run(
                 recovery_count += 1;
                 update_recovery_count(&status_tx, recovery_count);
 
-                info!(
-                    attempt = consecutive_failures,
-                    "Attempting USB reset recovery"
-                );
-                let product_for_reset = last_product.unwrap_or_else(|| {
-                    warn!("No product detected yet, falling back to Facecam for USB reset");
-                    facecam_common::device::ElgatoProduct::Facecam
-                });
-                match recovery::usb_reset_product(product_for_reset) {
+                if consecutive_failures == 1 {
+                    info!("Rung 2 recovery: reopening pipeline (no USB reset)");
+                    // Brief settle before reopen — the source fd was just dropped, give the
+                    // kernel a moment to release v4l2 state before we re-probe.
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+
+                info!(attempt = consecutive_failures, "Rung 3 recovery: USB reset");
+                // Re-detect on every rung-3 cycle so a hot-plugged different product gets
+                // the right reset. Fall back to the startup product if re-detection fails
+                // (device unplugged mid-recovery is the obvious case).
+                let reset_product = detect_source(&config.source_device)
+                    .map(|(_, p, _)| p)
+                    .unwrap_or_else(|e| {
+                        warn!(error = %e, fallback = %product, "Re-detect for reset failed; using startup product");
+                        product
+                    });
+                match recovery::usb_reset_product(reset_product) {
                     Ok(reset) => {
-                        info!(sysfs = %reset.sysfs_path.display(), "USB reset successful");
-                        // Wait for device to stabilize
+                        info!(
+                            sysfs = %reset.sysfs_path.display(),
+                            warnings = reset.warnings.len(),
+                            "USB reset successful"
+                        );
+                        for w in &reset.warnings {
+                            warn!(warning = %w, "USB reset warning");
+                        }
+                        // USB reset triggers re-enumeration. The kernel needs ~1-2s to
+                        // re-bind the UVC driver and (re)create /dev/videoN.
                         std::thread::sleep(Duration::from_secs(2));
-                        // Reset consecutive failures on successful recovery
                         consecutive_failures = 0;
                     }
                     Err(reset_err) => {
                         error!(error = %reset_err, "USB reset failed");
-                        // Wait before retrying
+                        // Back off longer on reset failure to avoid hammering sysfs while
+                        // udev or the bus is still settling from a prior reset attempt.
                         std::thread::sleep(Duration::from_secs(3));
                     }
                 }
@@ -112,77 +128,83 @@ pub fn run(
     }
 }
 
-/// Run a single pipeline lifecycle — returns on error or shutdown
 fn run_pipeline_once(
     config: &PipelineConfig,
     status_tx: &Arc<Mutex<watch::Sender<DaemonStatus>>>,
     shutdown_rx: &mut broadcast::Receiver<()>,
-    last_product: &mut Option<facecam_common::device::ElgatoProduct>,
 ) -> Result<()> {
-    // Phase 1: Detect device
     update_state(status_tx, PipelineState::Probing, HealthStatus::Degraded);
     let (source_path, product, firmware) = detect_source(&config.source_device)?;
-    *last_product = Some(product);
     info!(source = %source_path, product = %product, firmware = %firmware, "Source device detected");
     update_source(status_tx, Some(source_path.clone()));
 
-    // Phase 2: Probe and configure
-    let source_file = v4l2::open_device(&source_path).context("Failed to open source device")?;
+    let source_file = v4l2::open_device_nonblocking(&source_path)
+        .with_context(|| format!("Failed to open {} ({})", product, source_path))?;
     let source_fd = source_file.as_raw_fd();
 
-    let caps =
-        v4l2::query_capabilities(source_fd).context("Failed to query source capabilities")?;
-    info!(driver = %caps.driver, card = %caps.card, "Source device capabilities");
-
+    let caps = v4l2::query_capabilities(source_fd)
+        .with_context(|| format!("Failed to query capabilities of {}", product))?;
     if !caps.has_capture {
-        bail!("Source device does not support video capture");
+        bail!("{} does not advertise VIDEO_CAPTURE", product);
+    }
+    if !caps.has_streaming {
+        bail!(
+            "{} does not advertise STREAMING (MMAP unsupported)",
+            product
+        );
     }
 
-    // Enumerate available modes and pick the best one
     let modes = v4l2::enumerate_all_modes(source_fd)?;
-    // Filter out modes whose format is in the quirk DB as known-broken
-    // for the detected (product, firmware). Modes not in the DB pass through —
-    // the daemon does not speculate about untested formats.
     let reliable_modes: Vec<_> = modes
         .iter()
         .filter(|m| !quirks::is_format_known_broken(product, firmware, m.format))
         .collect();
-
     if reliable_modes.is_empty() {
-        bail!("No reliable video modes available on source device");
+        bail!(
+            "No usable video modes for {} (all formats marked broken in quirk DB)",
+            product
+        );
     }
 
-    // Load profile to determine preferred mode
     let profile = profiles::load_profile(&config.profile_name).unwrap_or_else(|_| {
-        warn!(profile = %config.profile_name, "Failed to load profile, using defaults");
-        profiles::load_profile("default").unwrap_or_else(|_| facecam_common::profiles::Profile {
-            name: "fallback".to_string(),
-            description: "Auto-generated fallback".to_string(),
+        warn!(profile = %config.profile_name, "Failed to load profile, using built-in default");
+        profiles::Profile {
+            name: "fallback".into(),
+            description: "Auto-generated fallback".into(),
             video_mode: None,
             controls: Default::default(),
-        })
+        }
     });
 
-    // Select video mode
     let target_mode = if let Some(ref pvm) = profile.video_mode {
-        // Find matching mode from reliable set
+        let want_format = facecam_common::formats::PixelFormat::from_fourcc(u32::from_le_bytes(
+            pvm.format.as_bytes().try_into().unwrap_or(*b"MJPG"),
+        ));
         reliable_modes
             .iter()
             .find(|m| {
-                m.width == pvm.width && m.height == pvm.height && m.fps() >= pvm.fps as f64 - 1.0
+                m.width == pvm.width
+                    && m.height == pvm.height
+                    && m.format == want_format
+                    && m.fps() >= pvm.fps as f64 - 1.0
             })
             .copied()
+            .or_else(|| {
+                reliable_modes
+                    .iter()
+                    .find(|m| m.format == want_format)
+                    .copied()
+            })
             .or_else(|| reliable_modes.first().copied())
             .ok_or_else(|| anyhow::anyhow!("No matching video mode found"))?
     } else {
         reliable_modes
             .first()
+            .copied()
             .ok_or_else(|| anyhow::anyhow!("No reliable modes"))?
     };
 
     info!(mode = %target_mode, "Selected video mode");
-
-    // Set format on source
     v4l2::set_format(
         source_fd,
         target_mode.width,
@@ -191,25 +213,24 @@ fn run_pipeline_once(
     )
     .context("Failed to set source format")?;
 
-    // Apply control values from profile
     for (name, value) in &profile.controls {
-        if let Some(ctrl_id) = v4l2::control_name_to_id(name) {
+        let actual_name = product.control_alias(name).unwrap_or(name);
+        if let Some(ctrl_id) = v4l2::control_name_to_id(actual_name) {
             match v4l2::set_control(source_fd, ctrl_id, *value as i32) {
-                Ok(()) => debug!(control = %name, value, "Applied control"),
-                Err(e) => warn!(control = %name, value, error = %e, "Failed to apply control"),
+                Ok(()) => debug!(control = %actual_name, value, "Applied control"),
+                Err(e) => {
+                    warn!(control = %actual_name, value, error = %e, "Failed to apply control")
+                }
             }
         } else {
-            debug!(control = %name, "Unknown control name, skipping");
+            debug!(control = %actual_name, "Unknown control name, skipping");
         }
     }
 
-    // Phase 3: Open sink (v4l2loopback)
     update_state(status_tx, PipelineState::Starting, HealthStatus::Degraded);
     let sink_file = v4l2::open_device(&config.sink_device)
         .context("Failed to open sink device. Is v4l2loopback loaded?")?;
     let sink_fd = sink_file.as_raw_fd();
-
-    // Set output format on sink to match source
     v4l2::set_output_format(
         sink_fd,
         target_mode.width,
@@ -218,123 +239,113 @@ fn run_pipeline_once(
     )
     .context("Failed to set sink output format")?;
 
-    info!(sink = %config.sink_device, "Sink device configured");
-
-    // Phase 4: Start streaming
     update_state(status_tx, PipelineState::Streaming, HealthStatus::Healthy);
     update_mode(status_tx, Some(*target_mode));
     update_connected(status_tx, true);
 
-    info!("Pipeline streaming");
+    let mut session = CaptureSession::start(source_fd, *target_mode)?;
+    let frame_timeout = Duration::from_millis(config.frame_timeout_ms);
 
-    // Frame forwarding loop
-    // Using read/write I/O (simpler than MMAP for the normalization use case)
-    let frame_size = (target_mode.width * target_mode.height) as usize
-        * target_mode.format.bytes_per_pixel().unwrap_or(2.0) as usize;
-    let mut frame_buf = vec![0u8; frame_size];
-
-    let mut frames_captured: u64 = 0;
+    let mut frames_acquired: u64 = 0;
     let mut frames_written: u64 = 0;
     let mut frames_dropped: u64 = 0;
+    let mut rung1_attempts: u32 = 0;
     let mut last_stats = Instant::now();
 
-    // Request MMAP buffers on source for capture
-    // We use a simpler approach: try read() first, fall back to buffer-based streaming
-    // The v4l2loopback sink supports write() directly
-
     loop {
-        // Check for shutdown
         if shutdown_rx.try_recv().is_ok() {
-            info!("Shutdown signal in frame loop");
+            info!("Shutdown signal in capture loop");
+            session.stop()?;
             return Ok(());
         }
 
-        // Read frame from source using raw read (if READWRITE cap is available)
-        // Otherwise we'd need full MMAP buffer management
-        if caps.has_readwrite {
-            use std::io::Read;
-            let mut source_reader = &source_file;
-            match source_reader.read(&mut frame_buf) {
-                Ok(n) if n > 0 => {
-                    frames_captured += 1;
+        // Acquire frame, then immediately drop FrameRef to release the session borrow
+        // before any recovery path that needs to mutate session.
+        let frame_result: Result<Vec<u8>, anyhow::Error> =
+            session.next_frame(frame_timeout).map(|f| f.bytes.to_vec());
 
-                    // Write frame to sink
-                    use std::io::Write;
-                    let mut sink_writer = &sink_file;
-                    match sink_writer.write_all(&frame_buf[..n]) {
-                        Ok(()) => {
-                            frames_written += 1;
-                        }
-                        Err(e) => {
-                            frames_dropped += 1;
-                            if frames_dropped % 100 == 1 {
-                                warn!(error = %e, dropped = frames_dropped, "Sink write failed");
-                            }
+        match frame_result {
+            Ok(bytes) => {
+                use std::io::Write;
+                rung1_attempts = 0;
+                frames_acquired += 1;
+                let mut sink_writer = &sink_file;
+                match sink_writer.write_all(&bytes) {
+                    Ok(()) => {
+                        frames_written += 1;
+                    }
+                    Err(e) => {
+                        frames_dropped += 1;
+                        if frames_dropped % 100 == 1 {
+                            warn!(error = %e, dropped = frames_dropped, "Sink write failed");
                         }
                     }
-                }
-                Ok(_) => {
-                    warn!("Zero-length read from source");
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => {
-                    // Check if it's a temporary error
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::Interrupted
-                    {
-                        continue;
-                    }
-                    bail!("Source read error: {}", e);
                 }
             }
-        } else {
-            // Streaming I/O path (MMAP)
-            // For devices that don't support read(), we need buffer-based streaming.
-            // This is more complex but necessary for most UVC cameras.
-            bail!(
-                "Device does not support read() I/O. \
-                 MMAP streaming required (not yet implemented in this daemon version). \
-                 Consider using ffmpeg as an interim bridge."
-            );
+            Err(e) => {
+                let mut rung1_streamon_err: Option<anyhow::Error> = None;
+                let mut rung1_session_err: Option<anyhow::Error> = None;
+                if rung1_attempts == 0 {
+                    debug!(error = %e, "Rung 1 recovery: stream_off_then_on");
+                    rung1_attempts += 1;
+                    let _ = session.stop();
+                    if let Err(start_err) = recovery::stream_off_then_on(source_fd) {
+                        debug!(error = %start_err, "Rung 1 STREAMON failed; falling through to rung 2");
+                        rung1_streamon_err = Some(start_err);
+                    }
+                    match CaptureSession::start(source_fd, *target_mode) {
+                        Ok(s) => {
+                            session = s;
+                            continue;
+                        }
+                        Err(start_err) => {
+                            debug!(error = %start_err, "CaptureSession::start after rung 1 failed; rung 2");
+                            rung1_session_err = Some(start_err);
+                        }
+                    }
+                }
+                let _ = session.stop();
+                let detail = match (rung1_streamon_err, rung1_session_err) {
+                    (Some(s), Some(r)) => {
+                        format!(
+                            "{} (after rung 1 STREAMON: {}; session restart: {})",
+                            e, s, r
+                        )
+                    }
+                    (Some(s), None) => format!("{} (after rung 1 STREAMON: {})", e, s),
+                    (None, Some(r)) => format!("{} (after rung 1 session restart: {})", e, r),
+                    (None, None) => format!("{}", e),
+                };
+                bail!(
+                    "Capture failed twice in succession; reopening pipeline: {}",
+                    detail
+                );
+            }
         }
 
-        // Periodic stats update
         if last_stats.elapsed() > Duration::from_secs(5) {
-            let fps = frames_captured as f64 / last_stats.elapsed().as_secs_f64();
+            let fps = frames_acquired as f64 / last_stats.elapsed().as_secs_f64();
             debug!(
-                frames_captured,
+                frames_acquired,
                 frames_written,
                 frames_dropped,
                 fps = format!("{:.1}", fps),
                 "Pipeline stats"
             );
-
-            // Update shared status
-            update_frame_counts(status_tx, frames_captured, frames_written, frames_dropped);
+            update_frame_counts(status_tx, frames_acquired, frames_written, frames_dropped);
             last_stats = Instant::now();
         }
     }
 }
 
-fn detect_source(
-    explicit: &Option<String>,
-) -> Result<(
-    String,
-    facecam_common::device::ElgatoProduct,
-    facecam_common::device::FirmwareVersion,
-)> {
-    use facecam_common::device::{ElgatoProduct, FirmwareVersion, ProductDescriptor};
-
+fn detect_source(explicit: &Option<String>) -> Result<(String, ElgatoProduct, FirmwareVersion)> {
     if let Some(dev) = explicit {
         if std::path::Path::new(dev).exists() {
-            // Caller-provided path — best-effort fingerprint via the live bus.
             for cam in usb::enumerate_uvc_capture_devices()? {
                 if cam.v4l2_device.as_deref() == Some(dev.as_str()) {
                     return Ok((dev.clone(), cam.product, cam.firmware));
                 }
             }
-            // Unknown device behind the path; assume original Facecam to keep
-            // the original behavior compatible.
             return Ok((
                 dev.clone(),
                 ElgatoProduct::Facecam,
@@ -353,8 +364,6 @@ fn detect_source(
 
     let symlink = "/dev/video-facecam";
     if std::path::Path::new(symlink).exists() {
-        // Fallback: device exists but enumeration didn't bind it — assume
-        // original Facecam (back-compat).
         return Ok((
             symlink.to_string(),
             ElgatoProduct::Facecam,
@@ -365,7 +374,6 @@ fn detect_source(
     bail!("No Elgato UVC capture device found. Use --device /dev/videoN to override.")
 }
 
-// Status update helpers — these acquire the mutex briefly to update specific fields
 fn update_state(
     tx: &Arc<Mutex<watch::Sender<DaemonStatus>>>,
     state: PipelineState,

@@ -1,8 +1,3 @@
-mod config;
-mod ipc_server;
-mod pipeline;
-mod watchdog;
-
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
@@ -10,6 +5,7 @@ use tokio::sync::{watch, Mutex};
 use tracing::info;
 
 use facecam_common::types::{DaemonStatus, HealthStatus, PipelineState};
+use facecam_daemon::{config, ipc_server, pipeline, watchdog};
 
 #[derive(Parser)]
 #[command(name = "facecam-daemon")]
