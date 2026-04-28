@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 facecam-common.workspace = true
+facecam-daemon.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true

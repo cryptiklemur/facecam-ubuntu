@@ -320,6 +320,7 @@ dependencies = [
  "chrono",
  "clap",
  "facecam-common",
+ "facecam-daemon",
  "serde",
  "serde_json",
  "tracing",

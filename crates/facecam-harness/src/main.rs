@@ -107,11 +107,13 @@ fn main() -> Result<()> {
 
 fn cmd_full(cli: &Cli) -> Result<()> {
     let started_at = Utc::now();
-    let dev_path = resolve_device(&cli.device)?;
+    let (fingerprint, dev_path) = resolve_target(cli.device.as_deref())?;
+    let product = fingerprint.product;
     let mut tests = Vec::new();
 
     println!("=== Facecam Compatibility Harness — Full Suite ===\n");
-    println!("Device: {}\n", dev_path);
+    println!("Device:  {}", dev_path);
+    println!("Product: {}\n", product);
 
     // Test 1: Device detection
     tests.push(run_test("device_detection", test_device_detection));
@@ -146,6 +148,40 @@ fn cmd_full(cli: &Cli) -> Result<()> {
 
     // Test 8: Kernel module status
     tests.push(run_test("kernel_modules", test_kernel_modules));
+
+    // Pro-only tests — gated by applies_to filter.
+    let pro_only: &[ElgatoProduct] = &[ElgatoProduct::FacecamPro];
+
+    if test_applies(product, pro_only) {
+        let dp = dev_path.clone();
+        tests.push(run_test("pro_h264_probe", move || test_pro_h264_probe(&dp)));
+    } else {
+        println!("  [SKIP] pro_h264_probe (does not apply to {})", product);
+    }
+
+    if test_applies(product, pro_only) {
+        let dp = dev_path.clone();
+        tests.push(run_test("pro_nv12_known_broken", move || {
+            test_pro_nv12_known_broken(&dp)
+        }));
+    } else {
+        println!(
+            "  [SKIP] pro_nv12_known_broken (does not apply to {})",
+            product
+        );
+    }
+
+    if test_applies(product, pro_only) {
+        let dp = dev_path.clone();
+        tests.push(run_test("pro_stream_start_recovery", move || {
+            test_pro_stream_start_recovery(&dp)
+        }));
+    } else {
+        println!(
+            "  [SKIP] pro_stream_start_recovery (does not apply to {})",
+            product
+        );
+    }
 
     let completed_at = Utc::now();
     let passed = tests.iter().filter(|t| t.passed).count();
@@ -266,19 +302,20 @@ fn cmd_report(_cli: &Cli) -> Result<()> {
 // === Test implementations ===
 
 fn test_device_detection() -> Result<serde_json::Value> {
+    use facecam_common::device::ProductDescriptor;
     let devices = usb::enumerate_elgato_devices()?;
-    let facecams: Vec<_> = devices
+    let cams: Vec<_> = devices
         .iter()
-        .filter(|d| d.product.is_facecam_original())
+        .filter(|d| d.product.is_uvc_capture())
         .collect();
 
-    if facecams.is_empty() {
-        anyhow::bail!("No Elgato Facecam detected via USB enumeration");
+    if cams.is_empty() {
+        anyhow::bail!("No Elgato UVC capture device detected via USB enumeration");
     }
 
     Ok(serde_json::json!({
-        "count": facecams.len(),
-        "devices": facecams,
+        "count": cams.len(),
+        "devices": cams,
     }))
 }
 
@@ -559,6 +596,102 @@ fn test_usb_recovery() -> Result<serde_json::Value> {
     }))
 }
 
+// === Pro-only tests ===
+
+fn test_pro_h264_probe(dev_path: &str) -> Result<serde_json::Value> {
+    use facecam_common::formats::{PixelFormat, VideoMode};
+    use facecam_daemon::capture::CaptureSession;
+
+    let f = v4l2::open_device_nonblocking(dev_path)?;
+    let fd = f.as_raw_fd();
+    v4l2::set_format(fd, 1920, 1080, PixelFormat::H264.to_fourcc())?;
+    let mut session = CaptureSession::start(
+        fd,
+        VideoMode {
+            format: PixelFormat::H264,
+            width: 1920,
+            height: 1080,
+            fps_numerator: 1,
+            fps_denominator: 30,
+        },
+    )?;
+    let mut frames = 0;
+    for _ in 0..5 {
+        if session.next_frame(Duration::from_millis(1000)).is_ok() {
+            frames += 1;
+        }
+    }
+    session.stop()?;
+    if frames < 3 {
+        anyhow::bail!("only {}/5 H.264 frames received", frames);
+    }
+    Ok(serde_json::json!({ "frames_received": frames }))
+}
+
+fn test_pro_nv12_known_broken(dev_path: &str) -> Result<serde_json::Value> {
+    use facecam_common::formats::{PixelFormat, VideoMode};
+    use facecam_daemon::capture::CaptureSession;
+
+    let f = v4l2::open_device_nonblocking(dev_path)?;
+    let fd = f.as_raw_fd();
+    v4l2::set_format(fd, 1920, 1080, PixelFormat::Nv12.to_fourcc())?;
+    let mut session = match CaptureSession::start(
+        fd,
+        VideoMode {
+            format: PixelFormat::Nv12,
+            width: 1920,
+            height: 1080,
+            fps_numerator: 1,
+            fps_denominator: 30,
+        },
+    ) {
+        Ok(s) => s,
+        // STREAMON failure is also acceptable broken-state for BOGUS_NV12.
+        Err(_) => return Ok(serde_json::json!({ "result": "streamon_failed" })),
+    };
+    let got_frame = session.next_frame(Duration::from_millis(2000)).is_ok();
+    session.stop()?;
+    if got_frame {
+        anyhow::bail!(
+            "NV12 unexpectedly produced a frame on the Pro (BOGUS_NV12 quirk should hold)"
+        );
+    }
+    Ok(serde_json::json!({ "result": "no_frames_as_expected" }))
+}
+
+fn test_pro_stream_start_recovery(dev_path: &str) -> Result<serde_json::Value> {
+    use facecam_common::formats::{PixelFormat, VideoMode};
+    use facecam_daemon::capture::CaptureSession;
+
+    let f = v4l2::open_device_nonblocking(dev_path)?;
+    let fd = f.as_raw_fd();
+    v4l2::set_format(fd, 1920, 1080, PixelFormat::Mjpeg.to_fourcc())?;
+    let mode = VideoMode {
+        format: PixelFormat::Mjpeg,
+        width: 1920,
+        height: 1080,
+        fps_numerator: 1,
+        fps_denominator: 30,
+    };
+    let start = Instant::now();
+    for attempt in 1..=2 {
+        let mut session = CaptureSession::start(fd, mode)?;
+        if session.next_frame(Duration::from_millis(1000)).is_ok() {
+            session.stop()?;
+            let elapsed_ms = start.elapsed().as_millis();
+            return Ok(serde_json::json!({
+                "attempts": attempt,
+                "elapsed_ms": elapsed_ms,
+            }));
+        }
+        session.stop()?;
+        if attempt == 2 {
+            anyhow::bail!("two MJPG STREAMON attempts both failed to produce a frame");
+        }
+    }
+    anyhow::bail!("unreachable")
+}
+
 // === Helpers ===
 
 fn run_test<F>(name: &str, test_fn: F) -> TestResult
@@ -622,22 +755,87 @@ fn detect_product_firmware_or_default() -> (ElgatoProduct, FirmwareVersion) {
         ))
 }
 
-fn resolve_device(device: &Option<String>) -> Result<String> {
-    if let Some(dev) = device {
-        return Ok(dev.clone());
-    }
+/// Shared resolver mirroring `facecam-probe`'s `resolve_target`.
+/// Returns the device fingerprint and the resolved V4L2 path.
+fn resolve_target(
+    explicit_device: Option<&str>,
+) -> anyhow::Result<(facecam_common::device::DeviceFingerprint, String)> {
+    use facecam_common::device::{
+        DeviceFingerprint, ElgatoProduct, FirmwareVersion, ProductDescriptor, UsbSpeed,
+    };
 
-    let devices = usb::enumerate_elgato_devices()?;
-    for dev in &devices {
-        if !dev.product.is_facecam_original() {
-            continue;
-        }
-        if let Ok(Some(sysfs)) = usb::find_usb_sysfs_path(dev.usb_bus, dev.usb_address) {
-            if let Ok(Some(v4l2_dev)) = usb::find_v4l2_device_for_usb(&sysfs) {
-                return Ok(v4l2_dev);
+    if let Some(dev) = explicit_device {
+        if std::path::Path::new(dev).exists() {
+            for cam in usb::enumerate_uvc_capture_devices()? {
+                if cam.v4l2_device.as_deref() == Some(dev) {
+                    return Ok((cam, dev.to_string()));
+                }
             }
+            return Ok((
+                DeviceFingerprint {
+                    product: ElgatoProduct::Unknown(0),
+                    firmware: FirmwareVersion { major: 0, minor: 0 },
+                    serial: String::new(),
+                    usb_bus: 0,
+                    usb_address: 0,
+                    usb_port_numbers: vec![],
+                    usb_speed: UsbSpeed::Unknown,
+                    v4l2_device: Some(dev.to_string()),
+                    v4l2_sysfs_path: None,
+                    driver_version: None,
+                    card_name: None,
+                },
+                dev.to_string(),
+            ));
         }
+        anyhow::bail!("--device {} does not exist", dev);
     }
 
-    anyhow::bail!("Could not auto-detect Facecam. Use --device /dev/videoN")
+    let cams = usb::enumerate_uvc_capture_devices()?;
+    if let Some(cam) = cams
+        .iter()
+        .find(|c| c.product.is_uvc_capture() && c.v4l2_device.is_some())
+    {
+        let dev = cam.v4l2_device.clone().unwrap();
+        return Ok((cam.clone(), dev));
+    }
+
+    let symlink = "/dev/video-facecam";
+    if std::path::Path::new(symlink).exists() {
+        return Ok((
+            DeviceFingerprint {
+                product: ElgatoProduct::Facecam,
+                firmware: FirmwareVersion { major: 0, minor: 0 },
+                serial: String::new(),
+                usb_bus: 0,
+                usb_address: 0,
+                usb_port_numbers: vec![],
+                usb_speed: UsbSpeed::Unknown,
+                v4l2_device: Some(symlink.into()),
+                v4l2_sysfs_path: None,
+                driver_version: None,
+                card_name: None,
+            },
+            symlink.into(),
+        ));
+    }
+
+    let elgatos = usb::enumerate_elgato_devices().unwrap_or_default();
+    let connected: Vec<String> = elgatos.iter().map(|d| format!("{}", d.product)).collect();
+    anyhow::bail!(
+        "No Elgato UVC capture device found. Connected Elgato devices: {:?}",
+        connected
+    );
+}
+
+/// Returns true if the test should run on the resolved product.
+/// Empty `families` means the test applies to every UVC capture product.
+fn test_applies(product: ElgatoProduct, families: &[ElgatoProduct]) -> bool {
+    families.is_empty() || families.contains(&product)
+}
+
+/// Resolve a V4L2 device path — auto-detect if not specified.
+fn resolve_device(device: &Option<String>) -> Result<String> {
+    let (_fp, path) = resolve_target(device.as_deref())?;
+    Ok(path)
 }
