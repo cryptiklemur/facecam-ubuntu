@@ -64,6 +64,71 @@ impl ElgatoProduct {
     }
 }
 
+/// Static facts about an Elgato product that the device cannot self-report.
+/// Anything that CAN be probed (formats, controls, capabilities) is read at
+/// runtime via the v4l2 module — those do not belong here.
+pub trait ProductDescriptor {
+    /// True iff this product exposes a UVC video-capture interface.
+    /// HID-only Elgato devices (Stream Deck, Wave XLR) return false.
+    fn is_uvc_capture(&self) -> bool;
+
+    /// Slug used to look up family-specific profile defaults and in logs.
+    /// Siblings share a family: Facecam + USB2 fallback share "facecam";
+    /// Mk.2 + Mk.2-USB2 share "facecam-mk2".
+    fn family(&self) -> &'static str;
+
+    /// Resolve a profile's generic control name to the device's actual V4L2
+    /// control name. Returns None if the device uses the generic name as-is.
+    fn control_alias(&self, generic: &str) -> Option<&'static str>;
+}
+
+impl ProductDescriptor for ElgatoProduct {
+    // is_uvc_capture asymmetry note (2026-04-27):
+    // - FacecamUsb2Fallback (PID 0x0077) is the original Facecam's degraded USB2
+    //   mode: enumerates as a distinct PID with no UVC interface, only the
+    //   "USB3-REQUIRED-FOR-FACECAM" string descriptor. Returns false.
+    // - FacecamMk2Usb2 (PID 0x0094) is the MK.2's distinct USB2 operating PID.
+    //   MK.2 hardware is not available for empirical verification in this session;
+    //   inclusion here is provisional and should be re-checked when an MK.2 is
+    //   tested. Returns true.
+    fn is_uvc_capture(&self) -> bool {
+        matches!(
+            self,
+            Self::Facecam
+                | Self::FacecamPro
+                | Self::FacecamMk2
+                | Self::FacecamMk2Usb2
+                | Self::CamLink4K
+        )
+    }
+
+    fn family(&self) -> &'static str {
+        match self {
+            Self::Facecam | Self::FacecamUsb2Fallback => "facecam",
+            Self::FacecamPro => "facecam-pro",
+            Self::FacecamMk2 | Self::FacecamMk2Usb2 => "facecam-mk2",
+            Self::CamLink4K => "cam-link-4k",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    fn control_alias(&self, generic: &str) -> Option<&'static str> {
+        match self {
+            Self::FacecamPro => match generic {
+                // Empirically observed control-name differences on PID 0x0079, 2026-04-27
+                "white_balance_auto" | "white_balance_temperature_auto" => {
+                    Some("white_balance_automatic")
+                }
+                "exposure_absolute" => Some("exposure_time_absolute"),
+                _ => None,
+            },
+            // Other products use the generic names as-is until empirical evidence
+            // demands an alias.
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for ElgatoProduct {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} (PID 0x{:04x})", self.name(), self.pid())
@@ -173,5 +238,97 @@ impl From<rusb::Speed> for UsbSpeed {
             rusb::Speed::SuperPlus => Self::SuperPlus,
             _ => Self::Unknown,
         }
+    }
+}
+
+#[cfg(test)]
+mod descriptor_tests {
+    use super::*;
+
+    #[test]
+    fn facecam_is_uvc_capture() {
+        assert!(ElgatoProduct::Facecam.is_uvc_capture());
+    }
+
+    #[test]
+    fn facecam_pro_is_uvc_capture() {
+        assert!(ElgatoProduct::FacecamPro.is_uvc_capture());
+    }
+
+    #[test]
+    fn mk2_pids_are_uvc_capture() {
+        assert!(ElgatoProduct::FacecamMk2.is_uvc_capture());
+        assert!(ElgatoProduct::FacecamMk2Usb2.is_uvc_capture());
+    }
+
+    #[test]
+    fn cam_link_is_uvc_capture() {
+        assert!(ElgatoProduct::CamLink4K.is_uvc_capture());
+    }
+
+    #[test]
+    fn usb2_fallback_is_not_uvc_capture() {
+        // USB2 fallback exposes no UVC interface per quirk USB2_FALLBACK_MODE
+        assert!(!ElgatoProduct::FacecamUsb2Fallback.is_uvc_capture());
+    }
+
+    #[test]
+    fn unknown_pids_are_not_uvc_capture() {
+        // Stream Deck Plus (0x0084), Wave XLR (0x007d), etc.
+        assert!(!ElgatoProduct::Unknown(0x0084).is_uvc_capture());
+        assert!(!ElgatoProduct::Unknown(0x007d).is_uvc_capture());
+    }
+
+    #[test]
+    fn family_slugs_group_siblings() {
+        assert_eq!(ElgatoProduct::Facecam.family(), "facecam");
+        assert_eq!(ElgatoProduct::FacecamUsb2Fallback.family(), "facecam");
+        assert_eq!(ElgatoProduct::FacecamPro.family(), "facecam-pro");
+        assert_eq!(ElgatoProduct::FacecamMk2.family(), "facecam-mk2");
+        assert_eq!(ElgatoProduct::FacecamMk2Usb2.family(), "facecam-mk2");
+        assert_eq!(ElgatoProduct::CamLink4K.family(), "cam-link-4k");
+        assert_eq!(ElgatoProduct::Unknown(0x1234).family(), "unknown");
+    }
+
+    #[test]
+    fn pro_remaps_white_balance_auto_alias() {
+        // Profiles use the generic key "white_balance_auto"; on the Pro the
+        // V4L2 control is named "white_balance_automatic".
+        assert_eq!(
+            ElgatoProduct::FacecamPro.control_alias("white_balance_auto"),
+            Some("white_balance_automatic")
+        );
+    }
+
+    #[test]
+    fn original_facecam_uses_generic_names() {
+        // Original profile keys match the device's V4L2 names. No alias needed.
+        assert_eq!(
+            ElgatoProduct::Facecam.control_alias("white_balance_auto"),
+            None
+        );
+        assert_eq!(ElgatoProduct::Facecam.control_alias("brightness"), None);
+    }
+
+    #[test]
+    fn pro_remaps_exposure_alias() {
+        // Original V4L2 name: exposure_absolute. Pro V4L2 name: exposure_time_absolute.
+        // Generic name (used in profiles): exposure_absolute (matches original).
+        assert_eq!(
+            ElgatoProduct::FacecamPro.control_alias("exposure_absolute"),
+            Some("exposure_time_absolute")
+        );
+    }
+
+    #[test]
+    fn pro_remaps_white_balance_temperature_auto_alias() {
+        // V4L2 control name on the original Facecam is `white_balance_temperature_auto`.
+        // Profiles authored against the original Facecam carry that key; on the Pro the
+        // equivalent control is `white_balance_automatic`. Both generic forms must alias
+        // to the Pro's name.
+        assert_eq!(
+            ElgatoProduct::FacecamPro.control_alias("white_balance_temperature_auto"),
+            Some("white_balance_automatic")
+        );
     }
 }
