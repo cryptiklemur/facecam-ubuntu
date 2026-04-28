@@ -314,6 +314,18 @@ fn main() -> Result<()> {
     capture.start().context("Failed to start streaming")?;
     println!("MMAP streaming started with 4 buffers.\n");
 
+    // Warm-up: the Facecam Pro hits PRO_STREAM_START_RACE on roughly half of
+    // first-STREAMON cycles, returning no frames. If no frame appears within
+    // ~1.2s, do a single in-place STREAMOFF/STREAMON recovery cycle (matches
+    // the harness probe and the daemon's rung-1 recovery). On the original
+    // Facecam this is a no-op when frames are flowing.
+    if !capture.frame_ready(1200).unwrap_or(false) {
+        eprintln!("No frames after 1.2s; restarting stream (PRO_STREAM_START_RACE recovery)");
+        if let Err(e) = capture.restart_stream() {
+            eprintln!("restart_stream failed: {e}");
+        }
+    }
+
     let vid_h = height as usize;
     let vid_w = width as usize;
 

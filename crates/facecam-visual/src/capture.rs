@@ -129,6 +129,47 @@ impl MmapCapture {
         Ok(())
     }
 
+    /// Recovery rung 1: STREAMOFF, re-enqueue all buffers, STREAMON.
+    /// Used to clear the Facecam Pro's PRO_STREAM_START_RACE — the first
+    /// STREAMON after open returns no frames roughly half the time. A clean
+    /// streamoff/requeue/streamon cycle reliably restores frame flow.
+    pub fn restart_stream(&mut self) -> Result<()> {
+        if self.streaming {
+            let mut buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE.to_ne_bytes();
+            let _ = unsafe { ioctl(self.fd, VIDIOC_STREAMOFF, buf_type.as_mut_ptr()) };
+            self.streaming = false;
+        }
+        for i in 0..self.buffers.len() as u32 {
+            let mut v4l2_buf = [0u8; V4L2_BUF_SIZE];
+            v4l2_buf[BUF_INDEX..BUF_INDEX + 4].copy_from_slice(&i.to_ne_bytes());
+            v4l2_buf[BUF_TYPE..BUF_TYPE + 4]
+                .copy_from_slice(&V4L2_BUF_TYPE_VIDEO_CAPTURE.to_ne_bytes());
+            v4l2_buf[BUF_MEMORY..BUF_MEMORY + 4].copy_from_slice(&V4L2_MEMORY_MMAP.to_ne_bytes());
+            unsafe { ioctl(self.fd, VIDIOC_QBUF, v4l2_buf.as_mut_ptr())? };
+        }
+        let mut buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE.to_ne_bytes();
+        unsafe { ioctl(self.fd, VIDIOC_STREAMON, buf_type.as_mut_ptr())? };
+        self.streaming = true;
+        Ok(())
+    }
+
+    /// Poll for an incoming frame without dequeuing. Returns `Ok(true)` if a
+    /// frame is ready, `Ok(false)` on timeout, and `Err` if the poll itself
+    /// fails. Used by warm-up paths that want to detect "no frames flowing"
+    /// before committing to the steady-state loop.
+    pub fn frame_ready(&self, timeout_ms: i32) -> Result<bool> {
+        let mut pollfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(ret > 0)
+    }
+
     /// Wait for and dequeue a frame. Returns (buffer_data, bytes_used).
     /// The data is valid until the next call to `dequeue_frame` with the same buffer index.
     pub fn dequeue_frame(&self) -> Result<(usize, &[u8])> {
