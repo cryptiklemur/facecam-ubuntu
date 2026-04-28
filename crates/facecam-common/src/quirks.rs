@@ -52,13 +52,16 @@ pub fn quirk_registry() -> &'static [Quirk] {
 static REGISTRY: &[Quirk] = &[
     Quirk {
         id: "BOGUS_NV12",
-        summary: "NV12 advertised but produces 0-byte streams",
-        description: "Both the original Facecam (PID 0x0078, fw 4.09) and the \
-            Facecam Pro (PID 0x0079, fw 0.06) advertise NV12 in their UVC \
-            descriptors, but `v4l2-ctl --stream-mmap pixelformat=NV12` returns \
-            zero bytes within a 5s timeout. Empirically verified on the Pro \
-            2026-04-27.",
-        products: &[ElgatoProduct::Facecam, ElgatoProduct::FacecamPro],
+        summary: "NV12 advertised but produces 0-byte streams (original Facecam)",
+        description: "The original Facecam (PID 0x0078, fw 4.09) advertises NV12 \
+            in its UVC descriptors, but `v4l2-ctl --stream-mmap pixelformat=NV12` \
+            returns zero bytes within a 5s timeout. Note: the Pro (PID 0x0079, \
+            fw 0.06) was originally suspected of the same behavior, but on \
+            2026-04-28 NV12 was empirically observed to deliver valid frames \
+            after a single STREAM_START_RACE recovery cycle, so the Pro is \
+            tracked under PRO_STREAM_START_RACE only and is no longer included \
+            in this quirk's applicability list.",
+        products: &[ElgatoProduct::Facecam],
         firmware_min: None,
         firmware_max: None,
         format: Some(PixelFormat::Nv12),

@@ -54,13 +54,20 @@ fn quirk_descriptions_are_non_empty() {
 }
 
 #[test]
-fn nv12_known_broken_on_facecam_and_pro() {
+fn nv12_known_broken_on_original_facecam() {
     assert!(is_format_known_broken(
         ElgatoProduct::Facecam,
         FW_FACECAM_409,
         PixelFormat::Nv12
     ));
-    assert!(is_format_known_broken(
+}
+
+#[test]
+fn nv12_not_known_broken_on_pro() {
+    // The Pro was originally suspected of BOGUS_NV12 but on 2026-04-28 NV12
+    // was observed to deliver valid frames after a single STREAM_START_RACE
+    // recovery cycle. The 0-byte symptom was the race, not a format quirk.
+    assert!(!is_format_known_broken(
         ElgatoProduct::FacecamPro,
         FW_PRO_006,
         PixelFormat::Nv12
