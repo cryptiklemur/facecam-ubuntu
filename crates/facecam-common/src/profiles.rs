@@ -58,8 +58,8 @@ pub fn load_profile(name: &str) -> Result<Profile> {
 }
 
 /// Load a profile applying family-prefixed lookup precedence:
-/// 1. ~/.config/facecam/profiles/<family>/<name>.toml
-/// 2. ~/.config/facecam/profiles/<name>.toml
+/// 1. `~/.config/facecam/profiles/<family>/<name>.toml`
+/// 2. `~/.config/facecam/profiles/<name>.toml`
 /// 3. Built-in defaults baked into the binary.
 pub fn load_profile_for_family(name: &str, family: &str) -> Result<Profile> {
     let dir = profiles_dir();
